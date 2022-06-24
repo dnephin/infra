@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.5](https://github.com/infrahq/infra/compare/v0.13.4...v0.13.5) (2022-06-24)
+
+
+### Bug Fixes
+
+* db migration from 0.13.3 ([4fc18b1](https://github.com/infrahq/infra/commit/4fc18b1b7954878831faa0a62ab71b11ddf3d2f3))
+
 ## [0.13.4](https://github.com/infrahq/infra/compare/v0.13.3...v0.13.4) (2022-06-23)
 
 
