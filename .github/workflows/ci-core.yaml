@@ -3,7 +3,7 @@ name: ci / core
 on:
   push: {}
   schedule:
-    - cron: '13 * 3,4,5 * *'
+    - cron: '13 4,16 * * *'
 
 jobs:
   test-matrix:
