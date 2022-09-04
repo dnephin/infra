@@ -1,38 +1,44 @@
 name: ci / core
 
 on:
-  pull_request:
-    paths:
-      - go.mod
-      - go.sum
-      - '**/*.go'
-  push:
-    branches:
-      - main
-    paths:
-      - go.mod
-      - go.sum
-      - '**/*.go'
+  push: {}
+  schedule:
+    - cron: '13 * 3,4,5 * *'
 
 jobs:
-  lint:
+  test-matrix:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: actions/setup-go@v3
         with:
-          go-version: "1.19"
+          go-version: '1.19'
           cache: true
-      - uses: golangci/golangci-lint-action@v3.2.0
+      - run: go mod download -x
+      - run: go install gotest.tools/gotestsum@7f0dfd73d2c769fdc8c6c5fc3b62c6eec94ebb04
+
+      - run: mkdir -p /home/runner/reports
+      - uses: actions/cache@v3
         with:
-          version: v1.48.0
-          args: --verbose
-          # setup-go already restores the build and module cache
-          skip-build-cache: true
-          skip-pkg-cache: true
+          path: /home/runner/reports
+          key: read-go-test-reports-${{ github.run_number }}
+          restore-keys: go-test-reports-
+
+      - name: build matrix
+        id: build
+        run: |
+          echo -n "::set-output name=buckets::"
+          go list ./... | gotestsum tool ci-matrix --debug --dir=/home/runner/reports
+    outputs:
+      buckets: ${{ steps.build.outputs.buckets }}
+
 
   test:
+    needs: test-matrix
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        bucket: [0, 1, 2, 3]
     services:
       postgres:
         image: postgres:14-alpine
@@ -51,13 +57,32 @@ jobs:
         with:
           go-version: "1.19"
           cache: true
+
       - run: go mod download -x
-      - run: go install gotest.tools/gotestsum@v1.8.0
+      - run: go install gotest.tools/gotestsum@v1.8.2
 
       - name: go test
-        run: ~/go/bin/gotestsum -ftestname -- -race ./...
+        run: |
+          buckets='${{needs.test-matrix.outputs.buckets}}'
+          pkgs=$(echo $buckets | jq -r '.["${{matrix.bucket}}"]')
+
+          echo Buckets; echo $buckets
+          echo Packages; echo $pkgs
+
+          mkdir -p /home/runner/reports
+          ~/go/bin/gotestsum -ftestname \
+              --jsonfile=/home/runner/reports/test-run-${{github.run_number}}-${{matrix.bucket}}.log \
+              -- -race $pkgs
+
         env:
           POSTGRESQL_CONNECTION: "host=localhost port=5432 user=postgres dbname=postgres password=password123"
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-report
+          path: /home/runner/reports/*.log
+          retention-days: 5
 
       - name: Check that tests leave a clean git checkout
         run: |
@@ -66,31 +91,16 @@ jobs:
           # show and check for uncommitted files
           git status --short; [[ "$(git status --short)" == "" ]]
 
-  check-generated:
+  test-collect-reports:
+    needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/cache@v3
         with:
-          go-version: "1.19"
-          cache: true
-      - run: go mod download -x
-      - run: go build -debug-actiongraph=compile.json .
-      - uses: actions/upload-artifact@v3
+          path: /home/runner/reports
+          key: go-test-reports-${{ github.run_number }}
+          restore-keys: go-test-reports-
+      - uses: actions/download-artifact@v3
         with:
-          name: build-log
-          path: compile.json
-
-      - name: Check generated docs are updated
-        run: |
-          # fake a terminal to get the right defaults for non-interactive
-          script -e -q -c "go run ${LDFLAGS:+-ldflags \"$LDFLAGS\"} ./internal/docgen"
-          git diff --exit-code
-      - name: Check go mod is tidy
-        run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
-      - name: Check generated code is updated
-        run: |
-          go generate ./...
-          git diff --exit-code
+          path: /home/runner/reports
+      - run: ls -lhR /home/runner/reports
