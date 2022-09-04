@@ -3,7 +3,7 @@ name: ci / core
 on:
   push: {}
   schedule:
-    - cron: '13 * 3,4,5 * *'
+    - cron: '13 4,16 * * *'
 
 jobs:
   test-matrix:
@@ -15,7 +15,7 @@ jobs:
           go-version: '1.19'
           cache: true
       - run: go mod download -x
-      - run: go install gotest.tools/gotestsum@7f0dfd73d2c769fdc8c6c5fc3b62c6eec94ebb04
+      - run: go install gotest.tools/gotestsum@59954ddc727bf5a476515780fac6e3e4f9c60957
 
       - run: mkdir -p /home/runner/reports
       - uses: actions/cache@v3
@@ -27,18 +27,25 @@ jobs:
       - name: build matrix
         id: build
         run: |
-          echo -n "::set-output name=buckets::"
-          go list ./... | gotestsum tool ci-matrix --debug --dir=/home/runner/reports
+          echo -n "::set-output name=matrix::"
+          go list ./... | gotestsum tool ci-matrix --debug \
+            --max-age-days 10 \
+            --partitions 3 \
+            --timing-files '/home/runner/reports/*.log'
+
     outputs:
-      buckets: ${{ steps.build.outputs.buckets }}
+      matrix: ${{ steps.build.outputs.matrix }}
 
 
   test:
     needs: test-matrix
     runs-on: ubuntu-latest
     strategy:
-      matrix:
-        bucket: [0, 1, 2, 3]
+      fail-fast: false
+      matrix: ${{ fromJson(needs.test-matrix.outputs.matrix) }}
+
+    name: "test ${{ matrix.description }}"
+
     services:
       postgres:
         image: postgres:14-alpine
@@ -63,16 +70,13 @@ jobs:
 
       - name: go test
         run: |
-          buckets='${{needs.test-matrix.outputs.buckets}}'
-          pkgs=$(echo $buckets | jq -r '.["${{matrix.bucket}}"]')
-
-          echo Buckets; echo $buckets
-          echo Packages; echo $pkgs
+          echo Partition
+          echo '${{ toJson(matrix) }}'
 
           mkdir -p /home/runner/reports
           ~/go/bin/gotestsum -ftestname \
-              --jsonfile=/home/runner/reports/test-run-${{github.run_number}}-${{matrix.bucket}}.log \
-              -- -race $pkgs
+              --jsonfile=/home/runner/reports/test-run-${{github.run_number}}-${{matrix.id}}.log \
+              -- -race ${{ join(matrix.packages, ' ') }}
 
         env:
           POSTGRESQL_CONNECTION: "host=localhost port=5432 user=postgres dbname=postgres password=password123"
