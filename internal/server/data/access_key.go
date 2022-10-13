@@ -246,7 +246,7 @@ func DeleteAccessKeys(tx WriteTxn, opts DeleteAccessKeysOptions) error {
 }
 
 // TODO: move this to access package?
-func ValidateRequestAccessKey(tx *Transaction, authnKey string) (*models.AccessKey, error) {
+func ValidateRequestAccessKey(tx TxnWithMetadata, authnKey string) (*models.AccessKey, error) {
 	keyID, secret, ok := strings.Cut(authnKey, ".")
 	if !ok {
 		return nil, fmt.Errorf("invalid access key format")

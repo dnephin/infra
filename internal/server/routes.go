@@ -223,10 +223,7 @@ func wrapRoute[Req, Res any](a *API, routeID routeIdentifier, route route[Req, R
 			DBTxn:         tx,
 			Authenticated: authned,
 		}
-		if org := rCtx.Authenticated.Organization; org != nil {
-			tx = tx.WithOrgID(org.ID)
-		}
-		rCtx.DBTxn = tx
+		tx.MetadataSource = rCtx.Authenticated
 		c.Set(access.RequestContextKey, rCtx)
 
 		resp, err := route.handler(c, req)

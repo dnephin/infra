@@ -640,15 +640,16 @@ func TestAPI_CreateGrant(t *testing.T) {
 	srv := setupServer(t, withAdminUser, withMultiOrgEnabled)
 	routes := srv.GenerateRoutes()
 
-	accessKey, err := data.ValidateRequestAccessKey(srv.DB(), adminAccessKey(srv))
+	tx := txnForTestCase(t, srv.db)
+	accessKey, err := data.ValidateRequestAccessKey(tx, adminAccessKey(srv))
 	assert.NilError(t, err)
 
 	someUser := models.Identity{Name: "someone@example.com"}
-	err = data.CreateIdentity(srv.DB(), &someUser)
+	err = data.CreateIdentity(tx, &someUser)
 	assert.NilError(t, err)
 
 	supportAdmin := models.Identity{Name: "support-admin@example.com"}
-	err = data.CreateIdentity(srv.DB(), &supportAdmin)
+	err = data.CreateIdentity(tx, &supportAdmin)
 	assert.NilError(t, err)
 
 	supportAdminGrant := models.Grant{
@@ -656,17 +657,18 @@ func TestAPI_CreateGrant(t *testing.T) {
 		Privilege: models.InfraSupportAdminRole,
 		Resource:  "infra",
 	}
-	err = data.CreateGrant(srv.DB(), &supportAdminGrant)
+	err = data.CreateGrant(tx, &supportAdminGrant)
 	assert.NilError(t, err)
 
 	token := &models.AccessKey{
 		IssuedFor:  supportAdmin.ID,
-		ProviderID: data.InfraProvider(srv.DB()).ID,
+		ProviderID: data.InfraProvider(tx).ID,
 		ExpiresAt:  time.Now().Add(10 * time.Second),
 	}
 
-	supportAccessKeyStr, err := data.CreateAccessKey(srv.DB(), token)
+	supportAccessKeyStr, err := data.CreateAccessKey(tx, token)
 	assert.NilError(t, err)
+	assert.NilError(t, tx.Commit())
 
 	otherOrg := createOtherOrg(t, srv.db)
 
