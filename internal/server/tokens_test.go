@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,7 +10,6 @@ import (
 	"gotest.tools/v3/assert"
 
 	"github.com/infrahq/infra/api"
-	"github.com/infrahq/infra/internal/access"
 	"github.com/infrahq/infra/internal/server/data"
 	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/internal/server/providers"
@@ -28,8 +26,7 @@ func TestAPI_CreateToken(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodPost, "/api/tokens", nil)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodPost, "/api/tokens", nil)
 		req.Header.Add("Infra-Version", apiVersionLatest)
 
 		if tc.setup != nil {
@@ -77,7 +74,7 @@ func TestAPI_CreateToken(t *testing.T) {
 				assert.Assert(t, respBody.Token != "")
 			},
 		},
-		"infra provider user with expired extension deadline on the access key": {
+		"infra provider user with expired inactivity timeout on the access key": {
 			setup: func(t *testing.T, req *http.Request) {
 				user := &models.Identity{
 					Name: "spike2@example.com",
@@ -91,7 +88,7 @@ func TestAPI_CreateToken(t *testing.T) {
 					IssuedFor:         user.ID,
 					ProviderID:        data.InfraProvider(srv.DB()).ID,
 					ExpiresAt:         time.Now().Add(10 * time.Second),
-					ExtensionDeadline: time.Now(),
+					InactivityTimeout: time.Now(),
 				}
 				accessKey, err := data.CreateAccessKey(srv.DB(), key)
 				assert.NilError(t, err)
@@ -151,20 +148,7 @@ func TestAPI_CreateToken(t *testing.T) {
 				assert.NilError(t, err)
 
 				ctx := providers.WithOIDCClient(req.Context(), &fakeOIDCImplementation{})
-				rCtx := access.RequestContext{
-					Request: req,
-					DBTxn:   srv.DB(),
-					Authenticated: access.Authenticated{
-						AccessKey: key,
-						User:      user,
-					},
-				}
-
-				// nolint: staticcheck
-				ctx = context.WithValue(ctx, access.RequestContextKey, rCtx)
-
 				*req = *req.WithContext(ctx)
-
 				req.Header.Set("Authorization", "Bearer "+accessKey)
 			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
@@ -203,20 +187,7 @@ func TestAPI_CreateToken(t *testing.T) {
 				assert.NilError(t, err)
 
 				ctx := providers.WithOIDCClient(req.Context(), &fakeOIDCImplementation{UserInfoRevoked: true})
-				rCtx := access.RequestContext{
-					Request: req,
-					DBTxn:   srv.DB(),
-					Authenticated: access.Authenticated{
-						AccessKey: key,
-						User:      user,
-					},
-				}
-
-				// nolint: staticcheck
-				ctx = context.WithValue(ctx, access.RequestContextKey, rCtx)
-
 				*req = *req.WithContext(ctx)
-
 				req.Header.Set("Authorization", "Bearer "+accessKey)
 			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {

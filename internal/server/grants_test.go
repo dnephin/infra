@@ -2,15 +2,18 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
+	"golang.org/x/sync/errgroup"
 	"gotest.tools/v3/assert"
 
 	"github.com/infrahq/infra/api"
@@ -20,7 +23,7 @@ import (
 )
 
 func TestAPI_ListGrants(t *testing.T) {
-	srv := setupServer(t, withAdminUser)
+	srv := setupServer(t, withAdminUser, withMultiOrgEnabled)
 	routes := srv.GenerateRoutes()
 
 	createID := func(t *testing.T, name string) uid.ID {
@@ -30,8 +33,7 @@ func TestAPI_ListGrants(t *testing.T) {
 		err := json.NewEncoder(&buf).Encode(body)
 		assert.NilError(t, err)
 
-		req, err := http.NewRequest(http.MethodPost, "/api/users", &buf)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodPost, "/api/users", &buf)
 		req.Header.Add("Authorization", "Bearer "+adminAccessKey(srv))
 		req.Header.Add("Infra-Version", "0.12.3")
 
@@ -44,20 +46,19 @@ func TestAPI_ListGrants(t *testing.T) {
 		return respObj.ID
 	}
 
-	createGrant := func(t *testing.T, user uid.ID, privilege string) {
+	createGrant := func(t *testing.T, user uid.ID, privilege, resource string) {
 		t.Helper()
 		var buf bytes.Buffer
-		body := api.CreateGrantRequest{
+		body := api.GrantRequest{
 			User:      user,
 			Privilege: privilege,
-			Resource:  "res1",
+			Resource:  resource,
 		}
 		err := json.NewEncoder(&buf).Encode(body)
 		assert.NilError(t, err)
 
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodPost, "/api/grants", &buf)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodPost, "/api/grants", &buf)
 		req.Header.Add("Authorization", "Bearer "+adminAccessKey(srv))
 		req.Header.Add("Infra-Version", "0.12.3")
 
@@ -82,9 +83,9 @@ func TestAPI_ListGrants(t *testing.T) {
 	idInGroup := createID(t, "inagroup@example.com")
 	idOther := createID(t, "other@example.com")
 
-	createGrant(t, idInGroup, "custom1")
-	createGrant(t, idOther, "custom2")
-	createGrant(t, idOther, "connector")
+	createGrant(t, idInGroup, "custom1", "res1")
+	createGrant(t, idOther, "custom2", "res1.ns1")
+	createGrant(t, idOther, "connector", "res1.ns2")
 
 	groupID := createGroup(t, "humans", idInGroup)
 	otherGroup := createGroup(t, "others", idOther)
@@ -98,8 +99,10 @@ func TestAPI_ListGrants(t *testing.T) {
 	accessKey, err := data.CreateAccessKey(srv.DB(), token)
 	assert.NilError(t, err)
 
-	admin, err := data.GetIdentity(srv.DB(), data.ByName("admin@example.com"))
+	admin, err := data.GetIdentity(srv.DB(), data.GetIdentityOptions{ByName: "admin@example.com"})
 	assert.NilError(t, err)
+
+	otherOrg := createOtherOrg(t, srv.db)
 
 	type testCase struct {
 		urlPath  string
@@ -108,8 +111,7 @@ func TestAPI_ListGrants(t *testing.T) {
 	}
 
 	run := func(t *testing.T, tc testCase) {
-		req, err := http.NewRequest(http.MethodGet, tc.urlPath, nil)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodGet, tc.urlPath, nil)
 		req.Header.Set("Authorization", "Bearer "+accessKey)
 		req.Header.Add("Infra-Version", "0.12.3")
 
@@ -149,6 +151,16 @@ func TestAPI_ListGrants(t *testing.T) {
 			urlPath: "/api/grants?resource=res1",
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
 				assert.Equal(t, resp.Code, http.StatusForbidden, resp.Body.String())
+			},
+		},
+		"not authorized, admin for wrong org": {
+			urlPath: "/api/grants?resource=res1",
+			setup: func(t *testing.T, req *http.Request) {
+				req.Host = "example.com"
+				req.Header.Set("Authorization", "Bearer "+otherOrg.AdminAccessKey)
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusBadRequest, resp.Body.String())
 			},
 		},
 		"authorized by grant": {
@@ -213,7 +225,7 @@ func TestAPI_ListGrants(t *testing.T) {
 				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
 			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
-				connector, err := data.GetIdentity(srv.DB(), data.ByName("connector"))
+				connector, err := data.GetIdentity(srv.DB(), data.GetIdentityOptions{ByName: "connector"})
 				assert.NilError(t, err)
 
 				assert.Equal(t, resp.Code, http.StatusOK, resp.Body.String())
@@ -240,12 +252,12 @@ func TestAPI_ListGrants(t *testing.T) {
 					{
 						User:      idOther,
 						Privilege: "custom2",
-						Resource:  "res1",
+						Resource:  "res1.ns1",
 					},
 					{
 						User:      idOther,
 						Privilege: "connector",
-						Resource:  "res1",
+						Resource:  "res1.ns2",
 					},
 				}
 				// check sort
@@ -275,7 +287,7 @@ func TestAPI_ListGrants(t *testing.T) {
 					{
 						User:      idOther,
 						Privilege: "custom2",
-						Resource:  "res1",
+						Resource:  "res1.ns1",
 					},
 				}
 				assert.DeepEqual(t, grants.Items, expected, cmpAPIGrantShallow)
@@ -307,12 +319,12 @@ func TestAPI_ListGrants(t *testing.T) {
 					{
 						User:      idOther,
 						Privilege: "custom2",
-						Resource:  "res1",
+						Resource:  "res1.ns1",
 					},
 					{
 						User:      idOther,
 						Privilege: "connector",
-						Resource:  "res1",
+						Resource:  "res1.ns2",
 					},
 				}
 				// check sort
@@ -340,16 +352,6 @@ func TestAPI_ListGrants(t *testing.T) {
 						Privilege: "custom1",
 						Resource:  "res1",
 					},
-					{
-						User:      idOther,
-						Privilege: "custom2",
-						Resource:  "res1",
-					},
-					{
-						User:      idOther,
-						Privilege: "connector",
-						Resource:  "res1",
-					},
 				}
 				assert.DeepEqual(t, grants.Items, expected, cmpAPIGrantShallow)
 			},
@@ -370,6 +372,37 @@ func TestAPI_ListGrants(t *testing.T) {
 						User:      idInGroup,
 						Privilege: "custom1",
 						Resource:  "res1",
+					},
+				}
+				assert.DeepEqual(t, grants.Items, expected, cmpAPIGrantShallow)
+			},
+		},
+		"filter by destination": {
+			urlPath: "/api/grants?destination=res1",
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusOK, resp.Body.String())
+				var grants api.ListResponse[api.Grant]
+				err = json.NewDecoder(resp.Body).Decode(&grants)
+				assert.NilError(t, err)
+
+				expected := []api.Grant{
+					{
+						User:      idInGroup,
+						Privilege: "custom1",
+						Resource:  "res1",
+					},
+					{
+						User:      idOther,
+						Privilege: "custom2",
+						Resource:  "res1.ns1",
+					},
+					{
+						User:      idOther,
+						Privilege: "connector",
+						Resource:  "res1.ns2",
 					},
 				}
 				assert.DeepEqual(t, grants.Items, expected, cmpAPIGrantShallow)
@@ -405,6 +438,71 @@ func TestAPI_ListGrants(t *testing.T) {
 				assert.DeepEqual(t, actual, expected, cmpAPIGrantJSON)
 			},
 		},
+		"unsupported filter with update index": {
+			urlPath: "/api/grants?destination=res1&lastUpdateIndex=1&user=1234",
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusBadRequest, resp.Body.String())
+
+				respBody := &api.Error{}
+				err := json.Unmarshal(resp.Body.Bytes(), respBody)
+				assert.NilError(t, err)
+
+				expected := []api.FieldError{
+					{
+						FieldName: "lastUpdateIndex",
+						Errors:    []string{"can not be used with user parameter(s)"},
+					},
+				}
+				assert.DeepEqual(t, respBody.FieldErrors, expected)
+			},
+		},
+		"no filter with update index": {
+			urlPath: "/api/grants?lastUpdateIndex=1",
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusBadRequest, resp.Body.String())
+
+				respBody := &api.Error{}
+				err := json.Unmarshal(resp.Body.Bytes(), respBody)
+				assert.NilError(t, err)
+
+				expected := []api.FieldError{
+					{
+						FieldName: "lastUpdateIndex",
+						Errors:    []string{"requires a supported filter"},
+					},
+				}
+				assert.DeepEqual(t, respBody.FieldErrors, expected)
+			},
+		},
+		"with stale update index": {
+			urlPath: "/api/grants?destination=res1&lastUpdateIndex=1",
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusOK, resp.Body.String())
+				var grants api.ListResponse[api.Grant]
+				err = json.NewDecoder(resp.Body).Decode(&grants)
+				assert.NilError(t, err)
+
+				expected := api.ListResponse[api.Grant]{
+					Items: []api.Grant{
+						{User: idInGroup, Privilege: "custom1", Resource: "res1"},
+						{User: idOther, Privilege: "custom2", Resource: "res1.ns1"},
+						{User: idOther, Privilege: "connector", Resource: "res1.ns2"},
+					},
+					Count: 3,
+				}
+				assert.DeepEqual(t, grants, expected, cmpAPIGrantShallow)
+				assert.Equal(t, resp.Result().Header.Get("Last-Update-Index"), "10004")
+			},
+		},
 	}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
@@ -424,8 +522,7 @@ func TestAPI_ListGrants_InheritedGrants(t *testing.T) {
 		err := json.NewEncoder(&buf).Encode(body)
 		assert.NilError(t, err)
 
-		req, err := http.NewRequest(http.MethodPost, "/api/users", &buf)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodPost, "/api/users", &buf)
 		req.Header.Add("Authorization", "Bearer "+adminAccessKey(srv))
 		req.Header.Add("Infra-Version", "0.12.3")
 
@@ -492,9 +589,7 @@ func TestAPI_ListGrants_InheritedGrants(t *testing.T) {
 	}
 
 	run := func(t *testing.T, tc testCase) {
-		req, err := http.NewRequest(http.MethodGet, tc.urlPath, nil)
-		assert.NilError(t, err)
-
+		req := httptest.NewRequest(http.MethodGet, tc.urlPath, nil)
 		req.Header.Add("Infra-Version", "0.12.3")
 
 		if tc.setup != nil {
@@ -528,31 +623,22 @@ func TestAPI_ListGrants_InheritedGrants(t *testing.T) {
 				assert.DeepEqual(t, grants.Items, expected, cmpAPIGrantShallow)
 			},
 		},
-		"can list grants without a subject": {
-			urlPath: "/api/grants?showInherited=1&resource=dinosaurs", // inherited doesn't mean anything here
+		"requires a userID with showInherited": {
+			urlPath: "/api/grants?showInherited=1&resource=dinosaurs",
 			setup: func(t *testing.T, req *http.Request) {
 				loginAs(t, idInGroup, req)
-
-				err = data.CreateGrant(srv.DB(), &models.Grant{
-					Subject:   uid.NewGroupPolymorphicID(zoologistsID),
-					Privilege: "examine",
-					Resource:  "dinosaurs",
-				})
-				assert.NilError(t, err)
 			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
-				assert.Equal(t, resp.Code, http.StatusOK, resp.Body.String())
-				var grants api.ListResponse[api.Grant]
-				err := json.NewDecoder(resp.Body).Decode(&grants)
+				assert.Equal(t, resp.Code, http.StatusBadRequest, resp.Body.String())
+
+				var respBody api.Error
+				err := json.NewDecoder(resp.Body).Decode(&respBody)
 				assert.NilError(t, err)
-				expected := []api.Grant{
-					{
-						Group:     zoologistsID,
-						Privilege: "examine",
-						Resource:  "dinosaurs",
-					},
+
+				expected := []api.FieldError{
+					{FieldName: "showInherited", Errors: []string{"requires a user ID"}},
 				}
-				assert.DeepEqual(t, grants.Items, expected, cmpAPIGrantShallow)
+				assert.DeepEqual(t, respBody.FieldErrors, expected)
 			},
 		},
 		"user can select grants for groups they are a member of": {
@@ -612,11 +698,208 @@ var cmpAPIGrantJSON = gocmp.Options{
 	gocmp.FilterPath(pathMapKey(`id`), cmpAnyValidUID),
 }
 
-func TestAPI_CreateGrant(t *testing.T) {
+func TestAPI_ListGrants_ExtendedRequestTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too long for short run")
+	}
+
+	withShortRequestTimeout := func(t *testing.T, options *Options) {
+		options.API.RequestTimeout = 250 * time.Millisecond
+		options.API.BlockingRequestTimeout = 1500 * time.Millisecond
+	}
+	srv := setupServer(t, withAdminUser, withShortRequestTimeout)
+	routes := srv.GenerateRoutes()
+
+	urlPath := "/api/grants?destination=infra&lastUpdateIndex=10001"
+	req := httptest.NewRequest(http.MethodGet, urlPath, nil)
+	req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+	req.Header.Add("Infra-Version", apiVersionLatest)
+
+	start := time.Now()
+	resp := httptest.NewRecorder()
+	routes.ServeHTTP(resp, req)
+
+	elapsed := time.Since(start)
+	assert.Assert(t, elapsed >= srv.options.API.BlockingRequestTimeout,
+		"elapsed=%v %v", elapsed, (*responseDebug)(resp))
+
+	assert.Equal(t, resp.Code, http.StatusNotModified, (*responseDebug)(resp))
+}
+
+func TestAPI_ListGrants_ExtendedRequestTimeout_CancelledByClient(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too long for short run")
+	}
+
+	withShortRequestTimeout := func(t *testing.T, options *Options) {
+		options.API.RequestTimeout = 250 * time.Millisecond
+		options.API.BlockingRequestTimeout = 2500 * time.Millisecond
+	}
+	srv := setupServer(t, withAdminUser, withShortRequestTimeout)
+	routes := srv.GenerateRoutes()
+
+	urlPath := "/api/grants?destination=infra&lastUpdateIndex=10001"
+	req := httptest.NewRequest(http.MethodGet, urlPath, nil)
+	req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+	req.Header.Add("Infra-Version", apiVersionLatest)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	t.Cleanup(cancel)
+	req = req.WithContext(ctx)
+
+	start := time.Now()
+	resp := httptest.NewRecorder()
+	routes.ServeHTTP(resp, req)
+
+	elapsed := time.Since(start)
+	assert.Assert(t, elapsed < time.Second,
+		"elapsed=%v %v", elapsed, (*responseDebug)(resp))
+
+	assert.Equal(t, resp.Code, http.StatusNotModified, (*responseDebug)(resp))
+}
+
+type responseDebug httptest.ResponseRecorder
+
+func (r *responseDebug) String() string {
+	if r == nil {
+		return "<nil>"
+	}
+	resp := (*httptest.ResponseRecorder)(r)
+	return fmt.Sprintf("code=%v headers=%v\n%v",
+		r.Code,
+		resp.Result().Header,
+		resp.Body.String())
+}
+
+func TestAPI_ListGrants_BlockingRequest_BlocksUntilUpdate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too long for short run")
+	}
+
 	srv := setupServer(t, withAdminUser)
 	routes := srv.GenerateRoutes()
 
-	accessKey, err := data.ValidateAccessKey(srv.DB(), adminAccessKey(srv))
+	g := errgroup.Group{}
+	respCh := make(chan *httptest.ResponseRecorder)
+	g.Go(func() error {
+		urlPath := "/api/grants?destination=infra&lastUpdateIndex=10001"
+		req := httptest.NewRequest(http.MethodGet, urlPath, nil)
+		req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+		req.Header.Add("Infra-Version", apiVersionLatest)
+
+		resp := httptest.NewRecorder()
+		routes.ServeHTTP(resp, req)
+		respCh <- resp
+		return nil
+	})
+
+	isBlocked(t, respCh)
+
+	// unrelated grant
+	err := data.CreateGrant(srv.db, &models.Grant{
+		Subject:   "i:abcd",
+		Privilege: "view",
+		Resource:  "somethingelse",
+	})
+	assert.NilError(t, err)
+	isBlocked(t, respCh)
+
+	// matching grant
+	err = data.CreateGrant(srv.db, &models.Grant{
+		Subject:   "i:abcd",
+		Privilege: "view",
+		Resource:  "infra",
+	})
+	assert.NilError(t, err)
+
+	resp := isNotBlocked(t, respCh)
+	assert.Equal(t, resp.Code, http.StatusOK, (*responseDebug)(resp))
+	assert.Equal(t, resp.Result().Header.Get("Last-Update-Index"), "10003", (*responseDebug)(resp))
+
+	respBody := &api.ListResponse[api.Grant]{}
+	assert.NilError(t, json.NewDecoder(resp.Body).Decode(respBody))
+
+	assert.Equal(t, len(respBody.Items), 2)
+}
+
+func isBlocked[T any](t *testing.T, ch chan T) {
+	t.Helper()
+	select {
+	case item := <-ch:
+		t.Fatalf("expected request to be blocked, but it returned: %v", item)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func isNotBlocked[T any](t *testing.T, ch chan T) (result T) {
+	t.Helper()
+	timeout := 100 * time.Millisecond
+	select {
+	case item := <-ch:
+		return item
+	case <-time.After(timeout):
+		t.Fatalf("expected request to not block, timeout after: %v", timeout)
+		return result
+	}
+}
+
+func TestAPI_ListGrants_BlockingRequest_NotFoundBlocksUntilUpdate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too long for short run")
+	}
+
+	srv := setupServer(t, withAdminUser)
+	routes := srv.GenerateRoutes()
+
+	g := errgroup.Group{}
+	respCh := make(chan *httptest.ResponseRecorder)
+	g.Go(func() error {
+		urlPath := "/api/grants?destination=deferred&lastUpdateIndex=1"
+		req := httptest.NewRequest(http.MethodGet, urlPath, nil)
+		req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+		req.Header.Add("Infra-Version", apiVersionLatest)
+
+		resp := httptest.NewRecorder()
+		routes.ServeHTTP(resp, req)
+		respCh <- resp
+		return nil
+	})
+
+	isBlocked(t, respCh)
+
+	// unrelated grant
+	err := data.CreateGrant(srv.db, &models.Grant{
+		Subject:   "i:abcd",
+		Privilege: "view",
+		Resource:  "somethingelse",
+	})
+	assert.NilError(t, err)
+	isBlocked(t, respCh)
+
+	// matching grant
+	err = data.CreateGrant(srv.db, &models.Grant{
+		Subject:   "i:abcd",
+		Privilege: "view",
+		Resource:  "deferred.ns1",
+	})
+	assert.NilError(t, err)
+
+	resp := isNotBlocked(t, respCh)
+	assert.Equal(t, resp.Code, http.StatusOK, (*responseDebug)(resp))
+	assert.Equal(t, resp.Result().Header.Get("Last-Update-Index"), "10003", (*responseDebug)(resp))
+
+	respBody := &api.ListResponse[api.Grant]{}
+	assert.NilError(t, json.NewDecoder(resp.Body).Decode(respBody))
+
+	assert.Equal(t, len(respBody.Items), 1)
+}
+
+func TestAPI_CreateGrant(t *testing.T) {
+	srv := setupServer(t, withAdminUser, withMultiOrgEnabled)
+	routes := srv.GenerateRoutes()
+
+	keyID, _, _ := strings.Cut(adminAccessKey(srv), ".")
+	accessKey, err := data.GetAccessKeyByKeyID(srv.DB(), keyID)
 	assert.NilError(t, err)
 
 	someUser := models.Identity{Name: "someone@example.com"}
@@ -644,16 +927,17 @@ func TestAPI_CreateGrant(t *testing.T) {
 	supportAccessKeyStr, err := data.CreateAccessKey(srv.DB(), token)
 	assert.NilError(t, err)
 
+	otherOrg := createOtherOrg(t, srv.db)
+
 	type testCase struct {
 		setup    func(t *testing.T, req *http.Request)
 		expected func(t *testing.T, resp *httptest.ResponseRecorder)
-		body     api.CreateGrantRequest
+		body     api.GrantRequest
 	}
 
 	run := func(t *testing.T, tc testCase) {
 		body := jsonBody(t, tc.body)
-		req, err := http.NewRequest(http.MethodPost, "/api/grants", body)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodPost, "/api/grants", body)
 		req.Header.Add("Infra-Version", "0.12.3")
 
 		if tc.setup != nil {
@@ -671,7 +955,7 @@ func TestAPI_CreateGrant(t *testing.T) {
 			setup: func(t *testing.T, req *http.Request) {
 				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
 			},
-			body: api.CreateGrantRequest{},
+			body: api.GrantRequest{},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
 				assert.Equal(t, resp.Code, http.StatusBadRequest, resp.Body.String())
 
@@ -680,18 +964,32 @@ func TestAPI_CreateGrant(t *testing.T) {
 				assert.NilError(t, err)
 
 				expected := []api.FieldError{
-					{Errors: []string{"one of (user, group) is required"}},
+					{Errors: []string{"one of (user, userName, group, groupName) is required"}},
 					{FieldName: "privilege", Errors: []string{"is required"}},
 					{FieldName: "resource", Errors: []string{"is required"}},
 				}
 				assert.DeepEqual(t, respBody.FieldErrors, expected)
 			},
 		},
+		"admin for wrong domain": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Host = "example.com"
+				req.Header.Set("Authorization", "Bearer "+otherOrg.AdminAccessKey)
+			},
+			body: api.GrantRequest{
+				User:      someUser.ID,
+				Privilege: models.InfraAdminRole,
+				Resource:  "some-cluster",
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusBadRequest, resp.Body.String())
+			},
+		},
 		"success": {
 			setup: func(t *testing.T, req *http.Request) {
 				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
 			},
-			body: api.CreateGrantRequest{
+			body: api.GrantRequest{
 				User:      someUser.ID,
 				Privilege: models.InfraAdminRole,
 				Resource:  "some-cluster",
@@ -723,7 +1021,7 @@ func TestAPI_CreateGrant(t *testing.T) {
 			setup: func(t *testing.T, req *http.Request) {
 				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
 			},
-			body: api.CreateGrantRequest{
+			body: api.GrantRequest{
 				User:      someUser.ID,
 				Privilege: models.InfraSupportAdminRole,
 				Resource:  "infra",
@@ -736,7 +1034,7 @@ func TestAPI_CreateGrant(t *testing.T) {
 			setup: func(t *testing.T, req *http.Request) {
 				req.Header.Set("Authorization", "Bearer "+supportAccessKeyStr)
 			},
-			body: api.CreateGrantRequest{
+			body: api.GrantRequest{
 				User:      someUser.ID,
 				Privilege: models.InfraSupportAdminRole,
 				Resource:  "infra",
@@ -774,7 +1072,7 @@ func TestAPI_CreateGrant(t *testing.T) {
 }
 
 func TestAPI_DeleteGrant(t *testing.T) {
-	srv := setupServer(t, withAdminUser)
+	srv := setupServer(t, withAdminUser, withMultiOrgEnabled)
 	routes := srv.GenerateRoutes()
 
 	user := &models.Identity{Name: "non-admin"}
@@ -782,13 +1080,36 @@ func TestAPI_DeleteGrant(t *testing.T) {
 	err := data.CreateIdentity(srv.DB(), user)
 	assert.NilError(t, err)
 
+	otherOrg := createOtherOrg(t, srv.db)
+
 	t.Run("last infra admin is deleted", func(t *testing.T) {
-		infraAdminGrants, err := data.ListGrants(srv.DB(), nil, data.ByPrivilege(models.InfraAdminRole), data.ByResource("infra"))
+		infraAdminGrants, err := data.ListGrants(srv.DB(), data.ListGrantsOptions{
+			ByPrivileges: []string{models.InfraAdminRole},
+			ByResource:   "infra",
+		})
 		assert.NilError(t, err)
 		assert.Assert(t, len(infraAdminGrants) == 1)
 
 		req := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/api/grants/%s", infraAdminGrants[0].ID), nil)
 		req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+		req.Header.Set("Infra-Version", apiVersionLatest)
+
+		resp := httptest.NewRecorder()
+		routes.ServeHTTP(resp, req)
+
+		assert.Equal(t, resp.Code, http.StatusBadRequest, resp.Body.String())
+	})
+	t.Run("admin for wrong organization", func(t *testing.T) {
+		grant := &models.Grant{
+			Subject:   uid.NewIdentityPolymorphicID(user.ID),
+			Privilege: models.InfraViewRole,
+			Resource:  "something",
+		}
+		err := data.CreateGrant(srv.DB(), grant)
+		assert.NilError(t, err)
+
+		req := httptest.NewRequest(http.MethodDelete, "/api/grants/"+grant.ID.String(), nil)
+		req.Header.Set("Authorization", "Bearer "+otherOrg.AdminAccessKey)
 		req.Header.Set("Infra-Version", apiVersionLatest)
 
 		resp := httptest.NewRecorder()
@@ -856,4 +1177,329 @@ func TestAPI_DeleteGrant(t *testing.T) {
 
 		assert.Equal(t, resp.Code, http.StatusNoContent, resp.Body.String())
 	})
+}
+
+func TestAPI_UpdateGrants(t *testing.T) {
+	srv := setupServer(t, withAdminUser, withMultiOrgEnabled)
+	routes := srv.GenerateRoutes()
+
+	user := &models.Identity{Name: "non-admin"}
+	group := &models.Group{Name: "mygroup"}
+
+	err := data.CreateIdentity(srv.DB(), user)
+	assert.NilError(t, err)
+
+	err = data.CreateGroup(srv.DB(), group)
+	assert.NilError(t, err)
+
+	err = data.AddUsersToGroup(srv.DB(), group.ID, []uid.ID{user.ID})
+	assert.NilError(t, err)
+
+	type testCase struct {
+		setup    func(t *testing.T, req *http.Request)
+		expected func(t *testing.T, resp *httptest.ResponseRecorder)
+		body     api.UpdateGrantsRequest
+	}
+
+	run := func(t *testing.T, tc testCase) {
+		body := jsonBody(t, tc.body)
+		req := httptest.NewRequest(http.MethodPatch, "/api/grants", body)
+		req.Header.Add("Infra-Version", "0.15.2")
+
+		if tc.setup != nil {
+			tc.setup(t, req)
+		}
+
+		resp := httptest.NewRecorder()
+		routes.ServeHTTP(resp, req)
+
+		tc.expected(t, resp)
+	}
+
+	testCases := map[string]testCase{
+		"success add": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			body: api.UpdateGrantsRequest{
+				GrantsToAdd: []api.GrantRequest{
+					{
+						User:      user.ID,
+						Privilege: models.InfraAdminRole,
+						Resource:  "some-cluster",
+					},
+				},
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusOK)
+
+				infraAdminGrants, err := data.ListGrants(srv.DB(), data.ListGrantsOptions{
+					ByPrivileges: []string{models.InfraAdminRole},
+					ByResource:   "some-cluster",
+				})
+				assert.NilError(t, err)
+				assert.Assert(t, len(infraAdminGrants) == 1)
+			},
+		},
+		"success add w/ own username": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			body: api.UpdateGrantsRequest{
+				GrantsToAdd: []api.GrantRequest{
+					{
+						UserName:  "admin@example.com",
+						Privilege: models.InfraAdminRole,
+						Resource:  "some-cluster2",
+					},
+				},
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusOK)
+
+				infraAdminGrants, err := data.ListGrants(srv.DB(), data.ListGrantsOptions{
+					ByPrivileges: []string{models.InfraAdminRole},
+					ByResource:   "some-cluster2",
+				})
+				assert.NilError(t, err)
+				assert.Assert(t, len(infraAdminGrants) == 1)
+			},
+		},
+		"success add w/ username": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			body: api.UpdateGrantsRequest{
+				GrantsToAdd: []api.GrantRequest{
+					{
+						UserName:  user.Name,
+						Privilege: models.InfraAdminRole,
+						Resource:  "some-cluster3",
+					},
+				},
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusOK)
+
+				infraAdminGrants, err := data.ListGrants(srv.DB(), data.ListGrantsOptions{
+					ByPrivileges: []string{models.InfraAdminRole},
+					ByResource:   "some-cluster3",
+				})
+				assert.NilError(t, err)
+				assert.Assert(t, len(infraAdminGrants) == 1)
+			},
+		},
+		"success add w/ groupname": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			body: api.UpdateGrantsRequest{
+				GrantsToAdd: []api.GrantRequest{
+					{
+						GroupName: group.Name,
+						Privilege: models.InfraAdminRole,
+						Resource:  "some-cluster4",
+					},
+				},
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusOK)
+
+				infraAdminGrants, err := data.ListGrants(srv.DB(), data.ListGrantsOptions{
+					ByPrivileges: []string{models.InfraAdminRole},
+					ByResource:   "some-cluster4",
+				})
+				assert.NilError(t, err)
+				assert.Assert(t, len(infraAdminGrants) == 1)
+			},
+		},
+		"success delete": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+
+				grantToAdd := models.Grant{
+					Subject:   uid.NewIdentityPolymorphicID(user.ID),
+					Privilege: models.InfraAdminRole,
+					Resource:  "another-cluster",
+				}
+
+				err := data.CreateGrant(srv.DB(), &grantToAdd)
+				assert.NilError(t, err)
+			},
+			body: api.UpdateGrantsRequest{
+				GrantsToRemove: []api.GrantRequest{
+					{
+						User:      user.ID,
+						Privilege: models.InfraAdminRole,
+						Resource:  "another-cluster",
+					},
+				},
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusOK)
+
+				infraAdminGrants, err := data.ListGrants(srv.DB(), data.ListGrantsOptions{
+					ByPrivileges: []string{models.InfraAdminRole},
+					ByResource:   "another-cluster",
+				})
+				assert.NilError(t, err)
+				assert.Assert(t, len(infraAdminGrants) == 0)
+			},
+		},
+		"success delete w/ username": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+
+				grantToAdd := models.Grant{
+					Subject:   uid.NewIdentityPolymorphicID(user.ID),
+					Privilege: models.InfraAdminRole,
+					Resource:  "another-cluster2",
+				}
+
+				err := data.CreateGrant(srv.DB(), &grantToAdd)
+				assert.NilError(t, err)
+			},
+			body: api.UpdateGrantsRequest{
+				GrantsToRemove: []api.GrantRequest{
+					{
+						UserName:  user.Name,
+						Privilege: models.InfraAdminRole,
+						Resource:  "another-cluster2",
+					},
+				},
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusOK)
+
+				infraAdminGrants, err := data.ListGrants(srv.DB(), data.ListGrantsOptions{
+					ByPrivileges: []string{models.InfraAdminRole},
+					ByResource:   "another-cluster2",
+				})
+				assert.NilError(t, err)
+				assert.Assert(t, len(infraAdminGrants) == 0)
+			},
+		},
+		"success delete w/ groupname": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+
+				grantToAdd := models.Grant{
+					Subject:   uid.NewIdentityPolymorphicID(group.ID),
+					Privilege: models.InfraAdminRole,
+					Resource:  "another-cluster3",
+				}
+
+				err := data.CreateGrant(srv.DB(), &grantToAdd)
+				assert.NilError(t, err)
+			},
+			body: api.UpdateGrantsRequest{
+				GrantsToRemove: []api.GrantRequest{
+					{
+						GroupName: group.Name,
+						Privilege: models.InfraAdminRole,
+						Resource:  "another-cluster3",
+					},
+				},
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusOK)
+
+				infraAdminGrants, err := data.ListGrants(srv.DB(), data.ListGrantsOptions{
+					ByPrivileges: []string{models.InfraAdminRole},
+					ByResource:   "another-cluster3",
+				})
+				assert.NilError(t, err)
+				assert.Assert(t, len(infraAdminGrants) == 0)
+			},
+		},
+		"failure missing subject": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			body: api.UpdateGrantsRequest{
+				GrantsToAdd: []api.GrantRequest{
+					{
+						Privilege: models.InfraAdminRole,
+						Resource:  "some-cluster",
+					},
+				},
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusBadRequest)
+			},
+		},
+		"failure missing resource": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			body: api.UpdateGrantsRequest{
+				GrantsToAdd: []api.GrantRequest{
+					{
+						UserName:  user.Name,
+						Privilege: models.InfraAdminRole,
+					},
+				},
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusBadRequest)
+			},
+		},
+		"failure missing privilege": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			body: api.UpdateGrantsRequest{
+				GrantsToAdd: []api.GrantRequest{
+					{
+						UserName: user.Name,
+						Resource: "some-cluster",
+					},
+				},
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusBadRequest)
+			},
+		},
+		"failure add w/ username": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			body: api.UpdateGrantsRequest{
+				GrantsToAdd: []api.GrantRequest{
+					{
+						UserName:  "unknown@example.com",
+						Privilege: models.InfraAdminRole,
+						Resource:  "some-cluster",
+					},
+				},
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusBadRequest)
+			},
+		},
+		"failure add w/ groupname": {
+			setup: func(t *testing.T, req *http.Request) {
+				req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
+			},
+			body: api.UpdateGrantsRequest{
+				GrantsToAdd: []api.GrantRequest{
+					{
+						GroupName: "unknowngroup",
+						Privilege: models.InfraAdminRole,
+						Resource:  "some-cluster",
+					},
+				},
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusBadRequest)
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			run(t, tc)
+		})
+	}
+
 }

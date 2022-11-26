@@ -1,10 +1,7 @@
-v ?= $(shell git describe --tags --abbrev=0)
-IMAGEVERSION ?= $(v:v%=%)
-
-test:
+test: check-psql-env
 	go test -short ./...
 
-test-all:
+test-all: check-psql-env
 	go test ./...
 
 # update the expected command output file
@@ -39,20 +36,25 @@ postgres:
 	docker run -d --name=postgres-dev --rm \
 		-e POSTGRES_PASSWORD=password123 \
 		--tmpfs=/var/lib/postgresql/data \
-		-p 5432:5432 \
-		postgres:14-alpine -c fsync=off -c full_page_writes=off
+		-p 127.0.0.1:15432:5432 \
+		postgres:14-alpine -c fsync=off -c full_page_writes=off \
+			-c max_connections=100
 	@echo
 	@echo Copy the line below into the shell used to run tests
-	@echo 'export POSTGRESQL_CONNECTION="host=localhost port=5432 user=postgres dbname=postgres password=password123"'
+	@echo 'export POSTGRESQL_CONNECTION="host=localhost port=15432 user=postgres dbname=postgres password=password123"'
 
+
+LINT_ARGS ?= --fix
 
 lint:
-	golangci-lint run --fix
-
-.PHONY: docs
-docs: docs/api/openapi3.json
-	go run ./internal/docgen
+	(cd ./internal/tools/querylinter/cmd; go build -o ./querylinter.so -buildmode=plugin .)
+	golangci-lint run $(LINT_ARGS)
 
 .PHONY: docs/api/openapi3.json
 docs/api/openapi3.json:
-	go run ./internal/openapigen $@
+	go run -ldflags '-s -X github.com/infrahq/infra/internal.Version=0.0.0' ./internal/openapigen $@
+
+check-psql-env:
+ifndef POSTGRESQL_CONNECTION
+	$(error POSTGRESQL_CONNECTION is not defined. Use `make postgres` if you need to start postgres)
+endif

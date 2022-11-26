@@ -2,20 +2,17 @@ package migrator
 
 import (
 	"database/sql"
-	"database/sql/driver"
-	"os"
-	"path/filepath"
 	"testing"
 
-	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
+	_ "github.com/jackc/pgx/v4/stdlib"
 	"gotest.tools/v3/assert"
+
+	"github.com/infrahq/infra/internal/testing/database"
 )
 
-type database struct {
+type dbDriver struct {
 	dialect string
-	driver  gorm.Dialector
+	dsn     string
 }
 
 var migrations = []*Migration{
@@ -56,7 +53,6 @@ var extendedMigrations = append(migrations, &Migration{
 })
 
 type Person struct {
-	gorm.Model
 	Name string
 }
 
@@ -72,7 +68,6 @@ CREATE TABLE people (
 }
 
 type Pet struct {
-	gorm.Model
 	Name     string
 	PersonID int
 }
@@ -90,7 +85,6 @@ CREATE TABLE pets (
 }
 
 type Book struct {
-	gorm.Model
 	Name     string
 	PersonID int
 }
@@ -222,9 +216,7 @@ func TestInitSchemaWithMigrations(t *testing.T) {
 	})
 }
 
-type Car struct {
-	gorm.Model
-}
+type Car struct{}
 
 func (c Car) Schema() string {
 	return `
@@ -361,53 +353,26 @@ func migrationCount(t *testing.T, db DB) (count int64) {
 }
 
 func runDBTests(t *testing.T, fn func(t *testing.T, db DB)) {
-	dir := t.TempDir()
+	databases := []dbDriver{}
 
-	databases := []database{
-		{dialect: "sqlite3", driver: sqlite.Open("file:" + filepath.Join(dir, "sqlite3.db"))},
-	}
-
-	if pg := os.Getenv("POSTGRESQL_CONNECTION"); pg != "" {
-		databases = append(databases, database{
-			dialect: "postgres", driver: postgres.Open(pg),
-		})
+	if pg := database.PostgresDriver(t, "_migrator"); pg != nil {
+		databases = append(databases, dbDriver{dialect: "postgres", dsn: pg.DSN})
 	}
 
 	for _, database := range databases {
 		// Ensure defers are not stacked up for each DB
-		t.Run(database.driver.Name(), func(t *testing.T) {
-			db, err := gorm.Open(database.driver, &gorm.Config{})
+		t.Run(database.dialect, func(t *testing.T) {
+			db, err := sql.Open("pgx", database.dsn)
 			assert.NilError(t, err, "Could not connect to database %s, %v", database.dialect, err)
 
 			for _, table := range []string{"migrations", "people", "pets", "books"} {
-				err := db.Exec(`DROP TABLE IF EXISTS ` + table).Error
+				_, err = db.Exec(`DROP TABLE IF EXISTS ` + table)
 				assert.NilError(t, err)
 			}
 
-			fn(t, gormDBShim{DB: db})
+			fn(t, db)
 		})
 	}
-}
-
-type gormDBShim struct {
-	*gorm.DB
-}
-
-func (d gormDBShim) DriverName() string {
-	return d.Dialector.Name()
-}
-
-func (d gormDBShim) Exec(query string, args ...any) (sql.Result, error) {
-	db := d.DB.Exec(query, args...)
-	return driver.RowsAffected(db.RowsAffected), db.Error
-}
-
-func (d gormDBShim) Query(query string, args ...any) (*sql.Rows, error) {
-	return d.DB.Raw(query, args...).Rows()
-}
-
-func (d gormDBShim) QueryRow(query string, args ...any) *sql.Row {
-	return d.DB.Raw(query, args...).Row()
 }
 
 // DefaultOptions used for tests

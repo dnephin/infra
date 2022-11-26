@@ -20,15 +20,15 @@ func (r ProviderAPICredentials) ValidationRules() []validate.ValidationRule {
 }
 
 type Provider struct {
-	ID       uid.ID   `json:"id"`
-	Name     string   `json:"name" example:"okta"`
+	ID       uid.ID   `json:"id" note:"Provider ID"`
+	Name     string   `json:"name" example:"okta" note:"Name of the provider"`
 	Created  Time     `json:"created"`
 	Updated  Time     `json:"updated"`
-	URL      string   `json:"url" example:"infrahq.okta.com"`
-	ClientID string   `json:"clientID" example:"0oapn0qwiQPiMIyR35d6"`
-	Kind     string   `json:"kind" example:"oidc"`
-	AuthURL  string   `json:"authURL" example:"https://example.com/oauth2/v1/authorize"`
-	Scopes   []string `json:"scopes" example:"['openid', 'email']"`
+	URL      string   `json:"url" example:"infrahq.okta.com" note:"URL of the Infra Server"`
+	ClientID string   `json:"clientID" example:"0oapn0qwiQPiMIyR35d6" note:"Client ID for the OIDC provider"`
+	Kind     string   `json:"kind" example:"oidc" note:"Kind of provider"`
+	AuthURL  string   `json:"authURL" example:"https://example.com/oauth2/v1/authorize" note:"Authorize endpoint for the OIDC provider"`
+	Scopes   []string `json:"scopes" example:"['openid', 'email']" note:"Scopes set in the OIDC provider configuration"`
 }
 
 type CreateProviderRequest struct {
@@ -45,12 +45,17 @@ var kinds = []string{"oidc", "okta", "azure", "google"}
 func (r CreateProviderRequest) ValidationRules() []validate.ValidationRule {
 	return []validate.ValidationRule{
 		ValidateName(r.Name),
-		validate.Required("name", r.Name),
 		validate.Required("url", r.URL),
 		validate.Required("clientID", r.ClientID),
 		validate.Required("clientSecret", r.ClientSecret),
 		validate.Enum("kind", r.Kind, kinds),
 	}
+}
+
+type PatchProviderRequest struct {
+	ID           uid.ID `uri:"id" json:"-"`
+	Name         string `json:"name" example:"okta"`
+	ClientSecret string `json:"clientSecret" example:"jmda5eG93ax3jMDxTGrbHd_TBGT6kgNZtrCugLbU"`
 }
 
 type UpdateProviderRequest struct {
@@ -76,7 +81,7 @@ func (r UpdateProviderRequest) ValidationRules() []validate.ValidationRule {
 }
 
 type ListProvidersRequest struct {
-	Name string `form:"name" example:"okta"`
+	Name string `form:"name" example:"okta" note:"Name of the provider"`
 	PaginationRequest
 }
 

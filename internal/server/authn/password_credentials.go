@@ -23,14 +23,17 @@ func NewPasswordCredentialAuthentication(username, password string) LoginMethod 
 	}
 }
 
-func (a *passwordCredentialAuthn) Authenticate(_ context.Context, db data.GormTxn, requestedExpiry time.Time) (AuthenticatedIdentity, error) {
-	identity, err := data.GetIdentity(db, data.ByName(a.Username))
+func (a *passwordCredentialAuthn) Authenticate(ctx context.Context, db *data.Transaction, requestedExpiry time.Time) (AuthenticatedIdentity, error) {
+	if a.Username == "" {
+		return AuthenticatedIdentity{}, fmt.Errorf("username required for password authentication")
+	}
+	identity, err := data.GetIdentity(db, data.GetIdentityOptions{ByName: a.Username})
 	if err != nil {
 		return AuthenticatedIdentity{}, fmt.Errorf("could not get identity for username: %w", err)
 	}
 
 	// Infra users can have only one username/password combo, look it up
-	userCredential, err := data.GetCredential(db, data.ByIdentityID(identity.ID))
+	userCredential, err := data.GetCredentialByUserID(db, identity.ID)
 	if err != nil {
 		return AuthenticatedIdentity{}, fmt.Errorf("validate creds get user: %w", err)
 	}

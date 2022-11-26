@@ -10,10 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	gocmp "github.com/google/go-cmp/cmp"
+	"golang.org/x/crypto/bcrypt"
 	"gotest.tools/v3/assert"
 
 	"github.com/infrahq/infra/api"
+	"github.com/infrahq/infra/internal/access"
 	"github.com/infrahq/infra/internal/generate"
 	"github.com/infrahq/infra/internal/server/data"
 	"github.com/infrahq/infra/internal/server/models"
@@ -32,8 +35,7 @@ func TestAPI_GetUser(t *testing.T) {
 		assert.NilError(t, err)
 
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodPost, "/api/users", &buf)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodPost, "/api/users", &buf)
 		req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
 		req.Header.Set("Infra-Version", apiVersionLatest)
 
@@ -64,8 +66,7 @@ func TestAPI_GetUser(t *testing.T) {
 	}
 
 	run := func(t *testing.T, tc testCase) {
-		req, err := http.NewRequest(http.MethodGet, tc.urlPath, nil)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodGet, tc.urlPath, nil)
 		req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
 		req.Header.Set("Infra-Version", apiVersionLatest)
 
@@ -165,6 +166,11 @@ func TestAPI_GetUser(t *testing.T) {
 					time.Now().UTC().Format(time.RFC3339),
 				))
 				actual := jsonUnmarshal(t, resp.Body.String())
+
+				var cmpAPIUserJSON = gocmp.Options{
+					gocmp.FilterPath(pathMapKey(`created`, `updated`, `lastSeenAt`), cmpApproximateTime),
+					gocmp.FilterPath(pathMapKey(`id`), cmpAnyValidUID),
+				}
 				assert.DeepEqual(t, actual, expected, cmpAPIUserJSON)
 			},
 		},
@@ -199,8 +205,7 @@ func TestAPI_ListUsers(t *testing.T) {
 		assert.NilError(t, err)
 
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodPost, "/api/users", &buf)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodPost, "/api/users", &buf)
 		req.Header.Add("Authorization", "Bearer "+adminAccessKey(srv))
 		req.Header.Add("Infra-Version", "0.12.3")
 
@@ -225,8 +230,7 @@ func TestAPI_ListUsers(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodGet, tc.urlPath, nil)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodGet, tc.urlPath, nil)
 		req.Header.Add("Authorization", "Bearer "+adminAccessKey(srv))
 		req.Header.Add("Infra-Version", "0.12.3")
 
@@ -456,8 +460,7 @@ func TestAPI_CreateUser(t *testing.T) {
 	run := func(t *testing.T, tc testCase) {
 		body := jsonBody(t, tc.body)
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodPost, "/api/users", body)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodPost, "/api/users", body)
 		req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
 		req.Header.Set("Infra-Version", apiVersionLatest)
 
@@ -573,10 +576,19 @@ func TestAPI_CreateUser(t *testing.T) {
 // Note this test is the result of a long conversation, don't change lightly.
 func TestAPI_CreateUserAndUpdatePassword(t *testing.T) {
 	srv := &Server{db: setupDB(t)}
-	db := srv.DB()
+	db := txnForTestCase(t, srv.db, srv.db.DefaultOrg.ID)
 
 	a := &API{server: srv}
 	admin := createAdmin(t, db)
+
+	loginAs := func(tx *data.Transaction, user *models.Identity) *gin.Context {
+		ctx, _ := gin.CreateTestContext(nil)
+		ctx.Set(access.RequestContextKey, access.RequestContext{
+			DBTxn:         tx,
+			Authenticated: access.Authenticated{User: user},
+		})
+		return ctx
+	}
 
 	t.Run("with an IDP user existing", func(t *testing.T) {
 		idp := &models.Provider{Name: "Super Provider", Kind: models.ProviderKindOIDC}
@@ -602,7 +614,7 @@ func TestAPI_CreateUserAndUpdatePassword(t *testing.T) {
 				assert.NilError(t, err)
 				_, err = data.GetProviderUser(db, data.InfraProvider(db).ID, user.ID)
 				assert.NilError(t, err)
-				cred, err := data.GetCredential(db, data.ByIdentityID(user.ID))
+				cred, err := data.GetCredentialByUserID(db, user.ID)
 				assert.NilError(t, err)
 				assert.Equal(t, true, cred.OneTimePassword)
 			})
@@ -610,18 +622,20 @@ func TestAPI_CreateUserAndUpdatePassword(t *testing.T) {
 		t.Run("as a user", func(t *testing.T) {
 			ctx := loginAs(db, user)
 			t.Run("with no existing infra user", func(t *testing.T) {
-				err = data.DeleteProviderUsers(db, data.ByIdentityID(user.ID), data.ByProviderID(data.InfraProvider(db).ID))
+				err = data.DeleteProviderUsers(db, data.DeleteProviderUsersOptions{ByIdentityID: user.ID, ByProviderID: data.InfraProvider(db).ID})
 				assert.NilError(t, err)
 
-				cred, _ := data.GetCredential(db, data.ByIdentityID(user.ID))
-				if cred != nil {
-					_ = data.DeleteCredential(db, cred.ID)
-				}
-
 				t.Run("I cannot set a password", func(t *testing.T) {
-					_, err := a.UpdateUser(ctx, &api.UpdateUserRequest{
-						ID:       user.ID,
-						Password: "1234567890987654321a!",
+					cred, err := data.GetCredentialByUserID(db, user.ID)
+					assert.NilError(t, err)
+					if cred != nil {
+						_ = data.DeleteCredential(db, cred.ID)
+					}
+
+					_, err = a.UpdateUser(ctx, &api.UpdateUserRequest{
+						ID:          user.ID,
+						OldPassword: "whatever",
+						Password:    "1234567890987654321a!",
 					})
 					assert.Error(t, err, "existing credential: record not found")
 				})
@@ -629,15 +643,24 @@ func TestAPI_CreateUserAndUpdatePassword(t *testing.T) {
 			t.Run("with an existing infra user", func(t *testing.T) {
 				_, _ = data.CreateProviderUser(db, data.InfraProvider(db), user)
 
+				cred, _ := data.GetCredentialByUserID(db, user.ID)
+				if cred != nil {
+					_ = data.DeleteCredential(db, cred.ID)
+				}
+
+				hash, err := bcrypt.GenerateFromPassword([]byte("random password"), bcrypt.DefaultCost)
+				assert.NilError(t, err)
+
 				_ = data.CreateCredential(db, &models.Credential{
 					IdentityID:   user.ID,
-					PasswordHash: []byte("random password"),
+					PasswordHash: hash,
 				})
 
 				t.Run("I can change my password", func(t *testing.T) {
 					_, err := a.UpdateUser(ctx, &api.UpdateUserRequest{
-						ID:       user.ID,
-						Password: "1234567890987654321a!",
+						ID:          user.ID,
+						OldPassword: "random password",
+						Password:    "1234567890987654321a!",
 					})
 					assert.NilError(t, err)
 				})
@@ -674,17 +697,21 @@ func TestAPI_CreateUserAndUpdatePassword(t *testing.T) {
 			_, err = data.CreateProviderUser(db, data.InfraProvider(db), user)
 			assert.NilError(t, err)
 
+			hash, err := bcrypt.GenerateFromPassword([]byte("random password"), bcrypt.DefaultCost)
+			assert.NilError(t, err)
+
 			err = data.CreateCredential(db, &models.Credential{
 				IdentityID:   user.ID,
-				PasswordHash: []byte("random password"),
+				PasswordHash: hash,
 			})
 			assert.NilError(t, err)
 
 			ctx := loginAs(db, user)
 			t.Run("I can change my password", func(t *testing.T) {
 				_, err := a.UpdateUser(ctx, &api.UpdateUserRequest{
-					ID:       user.ID,
-					Password: "123454676twefdhsds",
+					ID:          user.ID,
+					OldPassword: "random password",
+					Password:    "123454676twefdhsds",
 				})
 				assert.NilError(t, err)
 			})
@@ -696,11 +723,13 @@ func TestAPI_DeleteUser(t *testing.T) {
 	srv := setupServer(t, withAdminUser)
 	routes := srv.GenerateRoutes()
 
+	connector := data.InfraConnectorIdentity(srv.DB())
+
+	selfKey, selfUser := createAccessKey(t, srv.DB(), "user@example.com")
+
 	testUser := &models.Identity{Name: "test"}
 	err := data.CreateIdentity(srv.DB(), testUser)
 	assert.NilError(t, err)
-
-	connector := data.InfraConnectorIdentity(srv.DB())
 
 	type testCase struct {
 		name     string
@@ -711,9 +740,7 @@ func TestAPI_DeleteUser(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodDelete, tc.urlPath, nil)
-		assert.NilError(t, err)
-
+		req := httptest.NewRequest(http.MethodDelete, tc.urlPath, nil)
 		req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
 		req.Header.Set("Infra-Version", apiVersionLatest)
 
@@ -737,11 +764,10 @@ func TestAPI_DeleteUser(t *testing.T) {
 			},
 		},
 		{
-			name: "can not delete self",
+			name:    "can not delete self",
+			urlPath: "/api/users/" + selfUser.ID.String(),
 			setup: func(t *testing.T, req *http.Request) {
-				key, user := createAccessKey(t, srv.DB(), "usera@example.com")
-				req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", key))
-				req.URL.Path = "/api/users/" + user.ID.String()
+				req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", selfKey))
 			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
 				assert.Equal(t, http.StatusBadRequest, resp.Code, resp.Body.String())
@@ -783,8 +809,7 @@ func TestAPI_UpdateUser(t *testing.T) {
 
 		id := user.ID.String()
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodPut, "/api/users/"+id, body)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodPut, "/api/users/"+id, body)
 		req.Header.Set("Authorization", "Bearer "+adminAccessKey(srv))
 		req.Header.Set("Infra-Version", apiVersionLatest)
 
@@ -798,7 +823,7 @@ func TestAPI_UpdateUser(t *testing.T) {
 		tc.expected(t, resp)
 	}
 
-	var testCases = []testCase{
+	testCases := []testCase{
 		{
 			name: "not authenticated",
 			setup: func(t *testing.T, req *http.Request) {

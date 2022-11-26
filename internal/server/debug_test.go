@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -29,9 +28,8 @@ func TestAPI_PProfHandler(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodGet, "/api/debug/pprof/heap?debug=1", nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/debug/pprof/heap?debug=1", nil)
 		req.Header.Add("Infra-Version", "0.12.3")
-		assert.NilError(t, err)
 
 		if tc.setupRequest != nil {
 			tc.setupRequest(t, req)
@@ -100,24 +98,4 @@ func responseBodyAPIErrorWithCode(code int32) func(t *testing.T, resp *httptest.
 		assert.NilError(t, err)
 		assert.Equal(t, apiError.Code, code)
 	}
-}
-
-func createAccessKey(t *testing.T, db data.GormTxn, email string) (string, *models.Identity) {
-	t.Helper()
-	user := &models.Identity{Name: email}
-	err := data.CreateIdentity(db, user)
-	assert.NilError(t, err)
-
-	provider := data.InfraProvider(db)
-
-	token := &models.AccessKey{
-		IssuedFor:  user.ID,
-		ProviderID: provider.ID,
-		ExpiresAt:  time.Now().Add(10 * time.Second),
-	}
-
-	body, err := data.CreateAccessKey(db, token)
-	assert.NilError(t, err)
-
-	return body, user
 }

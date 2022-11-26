@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -96,8 +98,10 @@ func TestGet(t *testing.T) {
 		"User-Agent":      []string{fmt.Sprintf("Infra/%v (testing version; %v/%v)", apiVersion, runtime.GOOS, runtime.GOARCH)},
 	}
 
+	ctx := context.Background()
+
 	t.Run("success request", func(t *testing.T) {
-		_, err := get[stubResponse](c, "/good", Query{})
+		_, err := get[stubResponse](ctx, c, "/good", Query{})
 		assert.NilError(t, err)
 		req := <-requestCh
 		assert.Equal(t, req.Method, http.MethodGet)
@@ -106,7 +110,7 @@ func TestGet(t *testing.T) {
 	})
 
 	t.Run("bad request", func(t *testing.T) {
-		_, err := get[stubResponse](c, "/bad", Query{})
+		_, err := get[stubResponse](ctx, c, "/bad", Query{})
 		assert.Error(t, err, `bad request: it failed because`)
 		req := <-requestCh
 		assert.Equal(t, req.Method, http.MethodGet)
@@ -115,7 +119,7 @@ func TestGet(t *testing.T) {
 	})
 
 	t.Run("server error", func(t *testing.T) {
-		_, err := get[stubResponse](c, "/invalid", Query{})
+		_, err := get[stubResponse](ctx, c, "/invalid", Query{})
 		assert.Error(t, err, `500 internal server error`)
 		req := <-requestCh
 		assert.Equal(t, req.Method, http.MethodGet)
@@ -125,6 +129,7 @@ func TestGet(t *testing.T) {
 }
 
 func TestDelete(t *testing.T) {
+	ctx := context.Background()
 	ch := make(chan *http.Request, 1)
 	handler := func(rw http.ResponseWriter, r *http.Request) {
 		ch <- r
@@ -141,21 +146,81 @@ func TestDelete(t *testing.T) {
 	}
 
 	expected := http.Header{
-		"Accept-Encoding": []string{"gzip"},
-		"Authorization":   []string{"Bearer access-key"},
-		"Content-Type":    []string{"application/json"},
-		"Accept":          []string{"application/json"},
-		"Infra-Version":   []string{apiVersion},
-		"User-Agent":      []string{fmt.Sprintf("Infra/%v (testing version; %v/%v)", apiVersion, runtime.GOOS, runtime.GOARCH)},
+		"Accept-Encoding": {"gzip"},
+		"Authorization":   {"Bearer access-key"},
+		"Content-Type":    {"application/json"},
+		"Accept":          {"application/json"},
+		"Infra-Version":   {apiVersion},
+		"User-Agent":      {fmt.Sprintf("Infra/%v (testing version; %v/%v)", apiVersion, runtime.GOOS, runtime.GOARCH)},
 	}
 
 	t.Run("headers", func(t *testing.T) {
-		err := delete(c, "/good")
+		err := delete(ctx, c, "/good", Query{})
 		assert.NilError(t, err)
 
 		r := <-ch
 		assert.DeepEqual(t, r.Header, expected)
 		assert.Equal(t, r.Method, http.MethodDelete)
 		assert.Equal(t, r.URL.Path, "/good")
+	})
+}
+
+func TestListGrants(t *testing.T) {
+	reqCh := make(chan *http.Request, 1)
+	handler := func(resp http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			resp.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		switch r.URL.Path {
+		case "/api/grants":
+			reqCh <- r
+
+			lastUpdateIndex := r.URL.Query().Get("lastUpdateIndex")
+			if lastUpdateIndex == "70000" {
+				resp.WriteHeader(http.StatusNotModified)
+				return
+			}
+
+			resp.Header().Set("Last-Update-Index", "10010")
+			resp.WriteHeader(http.StatusOK)
+			_, _ = resp.Write([]byte(`{}`))
+		default:
+			resp.WriteHeader(http.StatusInternalServerError)
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(handler))
+
+	c := Client{
+		Name:      "testing",
+		Version:   "version",
+		URL:       srv.URL,
+		AccessKey: "the-access-key",
+	}
+
+	ctx := context.Background()
+
+	t.Run("sets value from Last-Update-Index header", func(t *testing.T) {
+		resp, err := c.ListGrants(ctx, ListGrantsRequest{
+			Resource:        "anything",
+			BlockingRequest: BlockingRequest{LastUpdateIndex: 1234},
+		})
+		assert.NilError(t, err)
+
+		assert.Equal(t, resp.LastUpdateIndex.Index, int64(10010))
+
+		req := <-reqCh
+		assert.Equal(t, req.URL.Query().Get("lastUpdateIndex"), "1234")
+	})
+	t.Run("not modified", func(t *testing.T) {
+		_, err := c.ListGrants(ctx, ListGrantsRequest{
+			Resource:        "anything",
+			BlockingRequest: BlockingRequest{LastUpdateIndex: 70000},
+		})
+		var apiError Error
+		assert.Assert(t, errors.As(err, &apiError), err)
+		expected := Error{Code: http.StatusNotModified}
+		assert.DeepEqual(t, apiError, expected)
 	})
 }

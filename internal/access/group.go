@@ -13,42 +13,30 @@ import (
 	"github.com/infrahq/infra/uid"
 )
 
-// isUserInGroup is used by authorization checks to see if the calling user is requesting their own attributes
-func isUserInGroup(c *gin.Context, requestedResourceID uid.ID) (bool, error) {
-	user := AuthenticatedIdentity(c)
-
-	if user != nil {
-		return userInGroup(getDB(c), user.ID, requestedResourceID), nil
-	}
-
-	return false, nil
-}
-
 func ListGroups(c *gin.Context, name string, userID uid.ID, p *data.Pagination) ([]models.Group, error) {
-	var selectors []data.SelectorFunc = []data.SelectorFunc{}
-	if name != "" {
-		selectors = append(selectors, data.ByName(name))
-	}
-	if userID != 0 {
-		selectors = append(selectors, data.ByGroupMember(userID))
+	rCtx := GetRequestContext(c)
+
+	opts := data.ListGroupsOptions{
+		ByName:        name,
+		ByGroupMember: userID,
+		Pagination:    p,
 	}
 
 	roles := []string{models.InfraAdminRole, models.InfraViewRole, models.InfraConnectorRole}
-	db, err := RequireInfraRole(c, roles...)
+	_, err := RequireInfraRole(c, roles...)
 	if err == nil {
-		return data.ListGroups(db, p, selectors...)
+		return data.ListGroups(rCtx.DBTxn, opts)
 	}
 	err = HandleAuthErr(err, "groups", "list", roles...)
 
 	if errors.Is(err, ErrNotAuthorized) {
 		// Allow an authenticated identity to view their own groups
-		db := getDB(c)
-		identity := AuthenticatedIdentity(c)
+		identity := rCtx.Authenticated.User
 		switch {
 		case identity == nil:
 			return nil, err
 		case userID == identity.ID:
-			return data.ListGroups(db, p, selectors...)
+			return data.ListGroups(rCtx.DBTxn, opts)
 		}
 	}
 
@@ -64,14 +52,25 @@ func CreateGroup(c *gin.Context, group *models.Group) error {
 	return data.CreateGroup(db, group)
 }
 
-func GetGroup(c *gin.Context, id uid.ID) (*models.Group, error) {
+func GetGroup(c *gin.Context, opts data.GetGroupOptions) (*models.Group, error) {
+	rCtx := GetRequestContext(c)
 	roles := []string{models.InfraAdminRole, models.InfraViewRole, models.InfraConnectorRole}
-	db, err := hasAuthorization(c, id, isUserInGroup, roles...)
-	if err != nil {
-		return nil, HandleAuthErr(err, "group", "get", roles...)
+	_, err := RequireInfraRole(c, roles...)
+	err = HandleAuthErr(err, "group", "get", roles...)
+	if errors.Is(err, ErrNotAuthorized) {
+		// get the group, but only to check if the user is in it
+		group, err := data.GetGroup(rCtx.DBTxn, opts)
+		if err != nil {
+			return nil, err
+		}
+		if !userInGroup(rCtx.DBTxn, rCtx.Authenticated.User.ID, group.ID) {
+			return nil, err
+		}
+		// authorized by user belonging to the requested group
+	} else if err != nil {
+		return nil, err
 	}
-
-	return data.GetGroup(db, data.ByID(id))
+	return data.GetGroup(rCtx.DBTxn, opts)
 }
 
 func DeleteGroup(c *gin.Context, id uid.ID) error {
@@ -79,16 +78,15 @@ func DeleteGroup(c *gin.Context, id uid.ID) error {
 	if err != nil {
 		return HandleAuthErr(err, "group", "delete", models.InfraAdminRole)
 	}
-
-	selectors := []data.SelectorFunc{
-		data.ByID(id),
-	}
-
-	return data.DeleteGroups(db, selectors...)
+	return data.DeleteGroup(db, id)
 }
 
-func checkIdentitiesInList(db data.GormTxn, ids []uid.ID) ([]uid.ID, error) {
-	identities, err := data.ListIdentities(db, nil, data.ByIDs(ids))
+func checkIdentitiesInList(db data.ReadTxn, ids []uid.ID) ([]uid.ID, error) {
+	if len(ids) == 0 {
+		return ids, nil
+	}
+
+	identities, err := data.ListIdentities(db, data.ListIdentityOptions{ByIDs: ids})
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +118,7 @@ func UpdateUsersInGroup(c *gin.Context, groupID uid.ID, uidsToAdd []uid.ID, uids
 		return err
 	}
 
-	_, err = data.GetGroup(db, data.ByID(groupID))
+	_, err = data.GetGroup(db, data.GetGroupOptions{ByID: groupID})
 	if err != nil {
 		return err
 	}
@@ -135,9 +133,16 @@ func UpdateUsersInGroup(c *gin.Context, groupID uid.ID, uidsToAdd []uid.ID, uids
 		return err
 	}
 
-	err = data.AddUsersToGroup(db, groupID, addIDList)
-	if err != nil {
-		return err
+	if len(addIDList) > 0 {
+		if err := data.AddUsersToGroup(db, groupID, addIDList); err != nil {
+			return err
+		}
 	}
-	return data.RemoveUsersFromGroup(db, groupID, rmIDList)
+
+	if len(rmIDList) > 0 {
+		if err := data.RemoveUsersFromGroup(db, groupID, rmIDList); err != nil {
+			return err
+		}
+	}
+	return nil
 }

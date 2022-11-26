@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -30,7 +31,13 @@ func setupServer(t *testing.T, ops ...func(*testing.T, *Options)) *Server {
 	t.Helper()
 	options := Options{
 		SessionDuration:          10 * time.Minute,
-		SessionExtensionDeadline: 30 * time.Minute,
+		SessionInactivityTimeout: 30 * time.Minute,
+		API: APIOptions{
+			RequestTimeout:         time.Minute,
+			BlockingRequestTimeout: 5 * time.Minute,
+		},
+		GoogleClientID:     "123",
+		GoogleClientSecret: "abc",
 	}
 	for _, op := range ops {
 		op(t, &options)
@@ -52,49 +59,49 @@ func setupServer(t *testing.T, ops ...func(*testing.T, *Options)) *Server {
 func TestGetPostgresConnectionURL(t *testing.T) {
 	logging.PatchLogger(t, zerolog.NewTestWriter(t))
 
-	r := newServer(Options{})
+	storage := map[string]secrets.SecretStorage{
+		"plaintext": secrets.NewPlainSecretProviderFromConfig(secrets.GenericConfig{}),
+	}
+	options := Options{}
 
-	f := secrets.NewPlainSecretProviderFromConfig(secrets.GenericConfig{})
-	r.secrets["plaintext"] = f
-
-	url, err := r.getPostgresConnectionString()
+	url, err := getPostgresConnectionString(options, storage)
 	assert.NilError(t, err)
-
 	assert.Assert(t, is.Len(url, 0))
 
-	r.options.DBHost = "localhost"
-
-	url, err = r.getPostgresConnectionString()
+	options.DBHost = "localhost"
+	url, err = getPostgresConnectionString(options, storage)
 	assert.NilError(t, err)
-
 	assert.Equal(t, "host=localhost", url)
 
-	r.options.DBPort = 5432
-
-	url, err = r.getPostgresConnectionString()
+	options.DBPort = 5432
+	url, err = getPostgresConnectionString(options, storage)
 	assert.NilError(t, err)
 	assert.Equal(t, "host=localhost port=5432", url)
 
-	r.options.DBUsername = "user"
-
-	url, err = r.getPostgresConnectionString()
+	options.DBUsername = "user"
+	url, err = getPostgresConnectionString(options, storage)
 	assert.NilError(t, err)
-
 	assert.Equal(t, "host=localhost user=user port=5432", url)
 
-	r.options.DBPassword = "plaintext:secret"
-
-	url, err = r.getPostgresConnectionString()
+	options.DBPassword = "plaintext:secret"
+	url, err = getPostgresConnectionString(options, storage)
 	assert.NilError(t, err)
-
 	assert.Equal(t, "host=localhost user=user password=secret port=5432", url)
 
-	r.options.DBName = "postgres"
-
-	url, err = r.getPostgresConnectionString()
+	options.DBName = "postgres"
+	url, err = getPostgresConnectionString(options, storage)
 	assert.NilError(t, err)
-
 	assert.Equal(t, "host=localhost user=user password=secret port=5432 dbname=postgres", url)
+
+	t.Run("connection string with password from secrets", func(t *testing.T) {
+		options := Options{
+			DBConnectionString: "host=localhost user=user port=5432",
+			DBPassword:         "plaintext:foo",
+		}
+		dsn, err := getPostgresConnectionString(options, storage)
+		assert.NilError(t, err)
+		assert.Equal(t, "host=localhost user=user port=5432 password=foo", dsn)
+	})
 }
 
 func TestServer_Run(t *testing.T) {
@@ -113,13 +120,11 @@ func TestServer_Run(t *testing.T) {
 			CA:           types.StringOrFile(golden.Get(t, "pki/ca.crt")),
 			CAPrivateKey: string(golden.Get(t, "pki/ca.key")),
 		},
+		API: APIOptions{RequestTimeout: time.Minute},
 	}
 
-	if driver := database.PostgresDriver(t, "_server_run"); driver != nil {
-		opts.DBConnectionString = driver.DSN
-	} else {
-		opts.DBFile = filepath.Join(dir, "sqlite3.db")
-	}
+	driver := database.PostgresDriver(t, "_server_run")
+	opts.DBConnectionString = driver.DSN
 
 	srv, err := New(opts)
 	assert.NilError(t, err)
@@ -209,18 +214,17 @@ func TestServer_Run_UIProxy(t *testing.T) {
 		DBEncryptionKey:         filepath.Join(dir, "sqlite3.db.key"),
 		TLSCache:                filepath.Join(dir, "tlscache"),
 		EnableSignup:            true,
+		BaseDomain:              "example.com",
 		TLS: TLSOptions{
 			CA:           types.StringOrFile(golden.Get(t, "pki/ca.crt")),
 			CAPrivateKey: string(golden.Get(t, "pki/ca.key")),
 		},
+		API: APIOptions{RequestTimeout: time.Minute},
 	}
 	assert.NilError(t, opts.UI.ProxyURL.Set(uiSrv.URL))
 
-	if driver := database.PostgresDriver(t, "_server_run"); driver != nil {
-		opts.DBConnectionString = driver.DSN
-	} else {
-		opts.DBFile = filepath.Join(dir, "sqlite3.db")
-	}
+	driver := database.PostgresDriver(t, "_server_run")
+	opts.DBConnectionString = driver.DSN
 
 	srv, err := New(opts)
 	assert.NilError(t, err)
@@ -261,23 +265,36 @@ func TestServer_GenerateRoutes_NoRoute(t *testing.T) {
 		name     string
 		path     string
 		setup    func(t *testing.T, req *http.Request)
-		expected func(t *testing.T, resp *httptest.ResponseRecorder)
+		expected func(t *testing.T, resp *http.Response)
 	}
 
+	message := `message through the proxy`
+	uiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(message))
+	}))
+	t.Cleanup(uiSrv.Close)
+
 	s := setupServer(t)
+	assert.NilError(t, s.options.UI.ProxyURL.Set(uiSrv.URL))
 	router := s.GenerateRoutes()
 
+	httpSrv := httptest.NewServer(router)
+	t.Cleanup(httpSrv.Close)
+
 	run := func(t *testing.T, tc testCase) {
-		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		u := httpSrv.URL + tc.path
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		assert.NilError(t, err)
 
 		if tc.setup != nil {
 			tc.setup(t, req)
 		}
 
-		resp := httptest.NewRecorder()
-		router.ServeHTTP(resp, req)
+		resp, err := httpSrv.Client().Do(req)
+		assert.NilError(t, err)
 
-		assert.Equal(t, resp.Code, http.StatusNotFound)
+		assert.Equal(t, resp.StatusCode, http.StatusNotFound)
 		if tc.expected != nil {
 			tc.expected(t, resp)
 		}
@@ -290,29 +307,35 @@ func TestServer_GenerateRoutes_NoRoute(t *testing.T) {
 			setup: func(t *testing.T, req *http.Request) {
 				req.Header.Set("Accept", "application/json; charset=utf-8")
 			},
-			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
-				contentType := resp.Header().Get("Content-Type")
+			expected: func(t *testing.T, resp *http.Response) {
+				contentType := resp.Header.Get("Content-Type")
 				expected := "application/json; charset=utf-8"
 				assert.Equal(t, contentType, expected)
 			},
 		},
 		{
 			name: "Other type",
-			path: "/not/found",
+			path: "/api/not/found",
 			setup: func(t *testing.T, req *http.Request) {
 				req.Header.Set("Accept", "*/*")
 			},
-			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+			expected: func(t *testing.T, resp *http.Response) {
+				body, err := io.ReadAll(resp.Body)
+				assert.NilError(t, err)
+
 				// response should be plaintext
-				assert.Equal(t, "404 not found", resp.Body.String())
+				assert.Equal(t, "404 not found", string(body))
 			},
 		},
 		{
 			name: "No header",
-			path: "/not/found/again",
-			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+			path: "/api/not/found/again",
+			expected: func(t *testing.T, resp *http.Response) {
+				body, err := io.ReadAll(resp.Body)
+				assert.NilError(t, err)
+
 				// response should be plaintext
-				assert.Equal(t, "404 not found", resp.Body.String())
+				assert.Equal(t, "404 not found", string(body))
 			},
 		},
 	}
@@ -327,8 +350,9 @@ func TestServer_GenerateRoutes_NoRoute(t *testing.T) {
 func TestServer_PersistSignupUser(t *testing.T) {
 	s := setupServer(t, func(_ *testing.T, opts *Options) {
 		opts.EnableSignup = true
+		opts.BaseDomain = "example.com"
 		opts.SessionDuration = time.Minute
-		opts.SessionExtensionDeadline = time.Minute
+		opts.SessionInactivityTimeout = time.Minute
 	})
 	routes := s.GenerateRoutes()
 
@@ -342,7 +366,7 @@ func TestServer_PersistSignupUser(t *testing.T) {
 		Password: passwd,
 		Org: api.SignupOrg{
 			Name:      "infrahq",
-			Subdomain: "myorg",
+			Subdomain: "myorg1243",
 		},
 	}
 	err := json.NewEncoder(&buf).Encode(signupReq)

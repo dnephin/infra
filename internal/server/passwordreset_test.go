@@ -2,9 +2,11 @@ package server
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"gotest.tools/v3/assert"
@@ -41,9 +43,7 @@ func TestPasswordResetFlow(t *testing.T) {
 	assert.NilError(t, err)
 
 	// nolint:noctx
-	req, err := http.NewRequest(http.MethodPost, "/api/password-reset-request", bytes.NewBuffer(body))
-	assert.NilError(t, err)
-
+	req := httptest.NewRequest(http.MethodPost, "/api/password-reset-request", bytes.NewBuffer(body))
 	req.Header.Add("Infra-Version", "0.13.6")
 
 	resp := httptest.NewRecorder()
@@ -54,9 +54,15 @@ func TestPasswordResetFlow(t *testing.T) {
 	assert.Assert(t, len(email.TestDataSent) > 0)
 
 	// cheat and grab the token from the db.
-	tokens := []string{}
-	err = s.db.Raw("select token from password_reset_tokens").Pluck("token", &tokens).Error
+	rows, err := s.db.Query("select token from password_reset_tokens")
 	assert.NilError(t, err)
+	tokens := []string{}
+	for rows.Next() {
+		var v string
+		assert.NilError(t, rows.Scan(&v))
+		tokens = append(tokens, v)
+	}
+	assert.NilError(t, rows.Close())
 
 	assert.Assert(t, len(tokens) > 0)
 	token := tokens[len(tokens)-1]
@@ -64,7 +70,11 @@ func TestPasswordResetFlow(t *testing.T) {
 	resetData, ok := email.TestDataSent[0].(email.PasswordResetData)
 	assert.Assert(t, ok)
 	// TODO: fix test so that we can verify the domain; default org has blank domain
-	assert.Equal(t, resetData.Link, "https:///password-reset?token="+token)
+	u, err := url.Parse(resetData.Link)
+	assert.NilError(t, err)
+	link, err := base64.URLEncoding.DecodeString(u.Query().Get("r"))
+	assert.NilError(t, err)
+	assert.Equal(t, string(link), "https:///password-reset?token="+token)
 
 	// reset the password with the token
 	body, err = json.Marshal(&api.VerifiedResetPasswordRequest{
@@ -74,9 +84,7 @@ func TestPasswordResetFlow(t *testing.T) {
 	assert.NilError(t, err)
 
 	// nolint:noctx
-	req, err = http.NewRequest(http.MethodPost, "/api/password-reset", bytes.NewBuffer(body))
-	assert.NilError(t, err)
-
+	req = httptest.NewRequest(http.MethodPost, "/api/password-reset", bytes.NewBuffer(body))
 	req.Header.Add("Infra-Version", "0.13.6")
 
 	resp = httptest.NewRecorder()

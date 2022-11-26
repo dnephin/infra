@@ -10,6 +10,7 @@ import (
 
 	"github.com/ssoroka/slice"
 
+	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/logging"
 )
 
@@ -19,6 +20,7 @@ const (
 	EmailTemplateSignup EmailTemplate = iota
 	EmailTemplatePasswordReset
 	EmailTemplateUserInvite
+	EmailTemplateForgottenDomains
 )
 
 type TemplateDetail struct {
@@ -39,6 +41,10 @@ var emailTemplates = map[EmailTemplate]TemplateDetail{
 		TemplateName: "user-invite",
 		Subject:      "{{.FromUserName}} has invited you to Infra",
 	},
+	EmailTemplateForgottenDomains: {
+		TemplateName: "forgot-domain",
+		Subject:      "Your sign-in links",
+	},
 }
 
 var (
@@ -57,22 +63,7 @@ func IsConfigured() bool {
 	return len(SendgridAPIKey) > 0
 }
 
-func SendTemplate(name, address string, template EmailTemplate, data any) error {
-	if TestMode {
-		logging.Debugf("sent email to %q: %+v\n", address, data)
-		TestDataSent = append(TestDataSent, data)
-		return nil // quietly return
-	}
-
-	if len(SendgridAPIKey) == 0 {
-		return ErrNotConfigured
-	}
-
-	if name == "" {
-		// until we have real user names
-		name = BuildNameFromEmail(address)
-	}
-
+func SendTemplate(name, address string, template EmailTemplate, data any, bypassListManagement bool) error {
 	details, ok := emailTemplates[template]
 	if !ok {
 		return ErrUnknownTemplate
@@ -86,6 +77,11 @@ func SendTemplate(name, address string, template EmailTemplate, data any) error 
 	w := &bytes.Buffer{}
 	if err := t.Execute(w, data); err != nil {
 		return fmt.Errorf("rendering subject: %w", err)
+	}
+
+	if name == "" {
+		// until we have real user names
+		name = BuildNameFromEmail(address)
 	}
 
 	msg := Message{
@@ -111,8 +107,24 @@ func SendTemplate(name, address string, template EmailTemplate, data any) error 
 	}
 	msg.HTMLBody = w.Bytes()
 
+	if TestMode {
+		logging.Debugf("sent email to %q: %+v\n", address, data)
+		logging.Debugf("plain: %s", string(msg.PlainBody))
+		logging.Debugf("html: %s", string(msg.HTMLBody))
+		TestDataSent = append(TestDataSent, data)
+		return nil // quietly return
+	}
+
+	if len(SendgridAPIKey) == 0 {
+		return ErrNotConfigured
+	}
+
 	// TODO: handle rate limiting, retries, understanding which errors are retryable, send queues, whatever
-	if err := SendSMTP(msg); err != nil {
+	if err := SendSMTP(msg, bypassListManagement); err != nil {
+		if err.Error() == "501 Recipient syntax error" {
+			logging.Errorf("SMTP mail delivery error: %s, user trying email %q", err, msg.ToAddress)
+			return internal.ErrBadRequest
+		}
 		logging.Errorf("SMTP mail delivery error: %s", err)
 		return err
 	}

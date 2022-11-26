@@ -12,22 +12,25 @@ import (
 	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/internal/testing/database"
 	"github.com/infrahq/infra/internal/testing/patch"
+	"github.com/infrahq/infra/uid"
 )
 
-func setupDB(t *testing.T) *data.DB {
+func setupDB(t *testing.T) *data.Transaction {
 	t.Helper()
-	driver := database.PostgresDriver(t, "_authn")
-	if driver == nil {
-		lite, err := data.NewSQLiteDriver("file::memory:")
-		assert.NilError(t, err)
-		driver = &database.Driver{Dialector: lite}
-	}
-
 	patch.ModelsSymmetricKey(t)
-	db, err := data.NewDB(driver.Dialector, nil)
+	db, err := data.NewDB(data.NewDBOptions{DSN: database.PostgresDriver(t, "_authn").DSN})
 	assert.NilError(t, err)
+	return txnForTestCase(t, db, db.DefaultOrg.ID)
+}
 
-	return db
+func txnForTestCase(t *testing.T, db *data.DB, orgID uid.ID) *data.Transaction {
+	t.Helper()
+	tx, err := db.Begin(context.Background(), nil)
+	assert.NilError(t, err)
+	t.Cleanup(func() {
+		_ = tx.Rollback()
+	})
+	return tx.WithOrgID(orgID)
 }
 
 func TestLogin(t *testing.T) {
@@ -70,7 +73,7 @@ func TestLogin(t *testing.T) {
 		assert.Assert(t, result.Bearer != "")
 		assert.Equal(t, result.AccessKey.IssuedFor, user.ID)
 		assert.Equal(t, result.AccessKey.ExpiresAt, exp)
-		assert.Equal(t, result.AccessKey.Extension, ext)
+		assert.Equal(t, result.AccessKey.InactivityExtension, ext)
 		assert.Equal(t, result.User.ID, user.ID)
 	})
 }

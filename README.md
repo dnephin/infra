@@ -7,90 +7,106 @@
 
 <div align="center">
 
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/infrahq/infra?color=brightgreen)](https://github.com/infrahq/infra/releases/latest) [![GitHub closed issues](https://img.shields.io/github/issues-closed/infrahq/infra?color=green)](https://github.com/infrahq/infra/issues) [![GitHub commit activity](https://img.shields.io/github/commit-activity/m/infrahq/infra)](https://github.com/infrahq/infra/commits/main)
-<br />
 [![YouTube Channel Views](https://img.shields.io/youtube/channel/views/UCft1MzQs2BJdW8BIUu6WJkw?style=social)](https://www.youtube.com/channel/UCft1MzQs2BJdW8BIUu6WJkw) [![GitHub Repo stars](https://img.shields.io/github/stars/infrahq/infra?style=social)](https://github.com/infrahq/infra/stargazers) [![Twitter Follow](https://img.shields.io/twitter/follow/infrahq?style=social)](https://twitter.com/infrahq)
 
 </div>
 
-## Introduction
+[Infra](https://infrahq.com) provides authentication and access management to servers, clusters, and databases.
 
-Infra manages access to infrastructure such as Kubernetes, with support for [more connectors](#connectors) coming soon.
+## Getting Started
 
-- **Discover & access** infrastructure via a single command: `infra login`
-- **No more out-of-sync credentials** for users (e.g. Kubeconfig)
-- **Okta, Google, Azure AD** identity provider support for onboarding and offboarding
-- **Fine-grained** access to specific resources that works with existing RBAC rules
-- **API-first design** for managing access as code or via existing tooling
-- **Temporary access** to coordinate access with systems like PagerDuty (coming soon)
-- **Audit logs** for who did what, when to stay compliant (coming soon)
+#### macOS
 
-![dashboard](https://user-images.githubusercontent.com/251292/179115227-d7bd9040-75bc-421d-87bf-4462a4fca38d.png)
-
-## Install
-
-Create a `values.yaml` file to define the first user. Update the email address and password accordingly:
-
-```yaml
-server:
-  config:
-    users:
-      - name: admin@example.com
-        password: SetThisPassword! #note this password is now set as plaintext in this file
-
-    # Create a "admin@example.com" user and set a password passed in as a file. The file will need
-    # to be mounted into the pod using `volumes` and `volumeMounts`.
-    # - name: admin@example.com
-    #   password: file:/var/run/secrets/admin@example.com
-
-    # Create an "admin@example.com" user and set a password passed in as an environment variable.
-    # The environment variable will need to be injected into the pod using `env` or `envFrom`.
-    # - name: admin@example.com
-    #   password: env:ADMIN_PASSWORD
-
-    grants:
-      - user: admin@example.com
-        role: admin
-        resource: infra
+```
+brew install infrahq/tap/infra
 ```
 
-Install Infra via `helm`:
+#### Windows
+
+```powershell
+scoop bucket add infrahq https://github.com/infrahq/scoop.git
+scoop install infra
+```
+
+#### Linux
+
+Download the [latest](https://github.com/infrahq/infra/releases/latest) packages from GitHub and install it with `dpkg`,  `apt`, `rpm`, or `dnf`.
+
+```
+sudo dpkg -i infra_*.deb
+
+sudo apt install ./infra_*.deb
+
+sudo rpm -i infra-*.rpm
+
+sudo dnf install infra-*.rpm
+```
+
+### Create an access key
+
+Log in to Infra. If you don't have a self-hosted Infra configured, you can sign up for a [free Infra instance](https://signup.infrahq.com) to get started.
+
+Set the INFRA_SERVER variable to your Infra URL:
+
+```
+export INFRA_SERVER=<org>.infrahq.com
+```
+
+```
+infra login 
+```
+
+You'll be prompted for the Infra URL you created when you signed up. (e.g. `<org>.infrahq.com`).
+
+Then, create an access key:
+
+```
+INFRA_ACCESS_KEY=$(infra keys add --connector -q)
+```
+
+### Connect Kubernetes cluster
+
+Install Infra connector via [helm](https://helm.sh):
 
 ```
 helm repo add infrahq https://helm.infrahq.com
 helm repo update
-helm upgrade --install infra infrahq/infra --values values.yaml
+helm install infra infrahq/infra --set connector.config.server=$INFRA_SERVER --set connector.config.accessKey=$INFRA_ACCESS_KEY --set connector.config.name=example
 ```
 
-Next, find the exposed hostname:
+### Access your cluster
+
+Give yourself permission to access the cluster:
 
 ```
-kubectl get service infra-server -o jsonpath="{.status.loadBalancer.ingress[*]['ip', 'hostname']}" -w
+infra grants add <your user email> example --role view
 ```
 
-Open this hostname in your browser to get started
+Use `infra list` to verify access.
 
-## Connectors
+Run `kubectl` to switch to your newly connected cluster.
 
-| Connector          | Status        | Documentation                                                 |
-| ------------------ | ------------- | ------------------------------------------------------------- |
-| Kubernetes         | ✅ Stable     | [Get started](https://infrahq.com/docs/connectors/kubernetes) |
-| Postgres           | _Coming soon_ | _Coming soon_                                                 |
-| SSH                | _Coming soon_ | _Coming soon_                                                 |
-| AWS                | _Coming soon_ | _Coming soon_                                                 |
-| Container Registry | _Coming soon_ | _Coming soon_                                                 |
-| MongoDB            | _Coming soon_ | _Coming soon_                                                 |
-| Snowflake          | _Coming soon_ | _Coming soon_                                                 |
-| MySQL              | _Coming soon_ | _Coming soon_                                                 |
-| RDP                | _Coming soon_ | _Coming soon_                                                 |
+```
+kubectl config use-context infra:example
+```
 
-## Documentation
+Alternatively, you can switch clusters via `infra use` command.
 
-- [Login via Infra CLI](https://infrahq.com/docs/configuration/logging-in)
-- [Helm Chart Reference](https://infrahq.com/docs/reference/helm-reference)
-- [What is Infra?](https://infrahq.com/docs/getting-started/what-is-infra)
-- [Architecture](https://infrahq.com/docs/reference/architecture)
-- [Security](https://infrahq.com/docs/reference/security)
+```
+infra use example
+```
+
+Lastly, try running a command on the Kubernetes cluster:
+
+```
+kubectl get pods -A
+```
+
+## Next steps
+
+Congratulations. You've successfully connected your first cluster.
+
+Infra works best when used with a team. Next, configure how users authenticate by connecting an [identity provider](https://infrahq.com/docs/manage/authentication#identity-providers), or add users directly by [inviting them](https://infrahq.com/docs/manage/users-groups#adding-a-user).
 
 ## Community
 

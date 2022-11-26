@@ -8,11 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/shirou/gopsutil/v3/process"
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/logging"
@@ -29,25 +30,40 @@ func newAgentCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			infraDir, err := initInfraHomeDir()
 			if err != nil {
-				panic(err)
+				return fmt.Errorf("infra home directory: %w", err)
 			}
-
 			logging.UseFileLogger(filepath.Join(infraDir, "agent.log"))
 
-			var wg sync.WaitGroup
-
-			// start background tasks
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			repeat.InGroup(&wg, ctx, cancel, 1*time.Minute, syncKubeConfig)
+			group, ctx := errgroup.WithContext(context.Background())
+			group.Go(func() error {
+				backOff := &backoff.ExponentialBackOff{
+					InitialInterval:     time.Minute,
+					MaxInterval:         2 * time.Minute,
+					RandomizationFactor: 0.05,
+					Multiplier:          1.5,
+					// MaxElapsedTime is the duration the infra agent should
+					// continue to run without a successful sync. After this time
+					// the agent will exit.
+					MaxElapsedTime: 5 * time.Minute,
+				}
+				waiter := repeat.NewWaiter(backOff)
+				for {
+					if err := syncKubeConfig(ctx); err != nil {
+						logging.L.Warn().Err(err).Msg("failed to sync kubeconfig")
+					} else {
+						waiter.Reset()
+					}
+					if err := waiter.Wait(ctx); err != nil {
+						return err
+					}
+				}
+			})
 			// add the next agent task here
 
 			logging.Infof("starting infra agent (%s)", internal.FullVersion())
-
-			wg.Wait()
-
-			return ctx.Err()
+			err = group.Wait()
+			logging.L.Error().Err(err).Msg("infra agent exit")
+			return err
 		},
 	}
 }
@@ -144,22 +160,22 @@ func writeAgentConfig(pid int) error {
 }
 
 // syncKubeConfig updates the local kubernetes configuration from Infra grants
-func syncKubeConfig(ctx context.Context, cancel context.CancelFunc) {
+func syncKubeConfig(_ context.Context) error {
 	client, err := defaultAPIClient()
 	if err != nil {
-		logging.Errorf("api client: %v\n", err)
-		cancel()
+		return fmt.Errorf("get api client: %w", err)
 	}
-
 	client.Name = "agent"
 
-	user, destinations, grants, err := getUserDestinationGrants(client)
+	user, destinations, grants, err := getUserDestinationGrants(client, "kubernetes")
 	if err != nil {
-		logging.Errorf("agent failed to get user destination grants: %v\n", err)
-		cancel()
+		return fmt.Errorf("list grants: %w", err)
 	}
+
 	if err := writeKubeconfig(user, destinations, grants); err != nil {
-		logging.Errorf("agent failed to update kube config: %v\n", err)
-		cancel()
+		return fmt.Errorf("update kubeconfig file: %w", err)
 	}
+
+	logging.L.Info().Msg("finished kubeconfig sync")
+	return nil
 }

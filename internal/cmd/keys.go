@@ -1,25 +1,28 @@
 package cmd
 
 import (
-	"fmt"
+	"context"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/infrahq/infra/api"
+	"github.com/infrahq/infra/internal/format"
 	"github.com/infrahq/infra/internal/logging"
-	"github.com/infrahq/infra/uid"
 )
 
-const thirtyDays = 30 * (24 * time.Hour)
+const (
+	thirtyDays = 30 * (24 * time.Hour)
+	oneYear    = 365 * (24 * time.Hour)
+)
 
 func newKeysCmd(cli *CLI) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "keys",
 		Short:   "Manage access keys",
 		Aliases: []string{"key"},
-		Group:   "Management commands:",
+		GroupID: groupManagement,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			if err := rootPreRun(cmd.Flags()); err != nil {
 				return err
@@ -37,27 +40,33 @@ func newKeysCmd(cli *CLI) *cobra.Command {
 
 type keyCreateOptions struct {
 	Name              string
-	TTL               time.Duration
-	ExtensionDeadline time.Duration
+	UserName          string
+	Expiry            time.Duration
+	InactivityTimeout time.Duration
+	Connector         bool
+	Quiet             bool
 }
 
 func newKeysAddCmd(cli *CLI) *cobra.Command {
 	var options keyCreateOptions
 
 	cmd := &cobra.Command{
-		Use:   "add USER|connector",
+		Use:   "add",
 		Short: "Create an access key",
 		Long:  `Create an access key for a user or a connector.`,
+		Args:  NoArgs,
 		Example: `
 # Create an access key named 'example-key' for a user that expires in 12 hours
-$ infra keys add user@example.com --ttl=12h --name example-key
+$ infra keys add --expiry=12h --name example-key
 
 # Create an access key to add a Kubernetes connection to Infra
-$ infra keys add connector
+$ infra keys add --connector
+
+# Set an environment variable with the newly created access key
+$ MY_ACCESS_KEY=$(infra keys add -q --name my-key)
 `,
-		Args: ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			userName := args[0]
+			ctx := context.Background()
 
 			if options.Name != "" {
 				if strings.Contains(options.Name, " ") {
@@ -70,23 +79,38 @@ $ infra keys add connector
 				return err
 			}
 
-			user, err := getUserByNameOrID(client, userName)
+			config, err := currentHostConfig()
 			if err != nil {
-				if api.ErrorStatusCode(err) == 403 {
-					logging.Debugf("%s", err.Error())
-					return Error{
-						Message: "Cannot create key: missing privileges for getUser",
-					}
-				}
 				return err
 			}
 
+			userID := config.UserID
+
+			// override the user setting if the user wants to create a connector access key
+			if options.Connector {
+				options.UserName = "connector"
+			}
+
+			if options.UserName != "" {
+				user, err := getUserByNameOrID(client, options.UserName)
+				if err != nil {
+					if api.ErrorStatusCode(err) == 403 {
+						logging.Debugf("%s", err.Error())
+						return Error{
+							Message: "Cannot list keys: missing privileges for GetUser",
+						}
+					}
+					return err
+				}
+				userID = user.ID
+			}
+
 			logging.Debugf("call server: create access key named %q", options.Name)
-			resp, err := client.CreateAccessKey(&api.CreateAccessKeyRequest{
-				UserID:            user.ID,
+			resp, err := client.CreateAccessKey(ctx, &api.CreateAccessKeyRequest{
+				UserID:            userID,
 				Name:              options.Name,
-				TTL:               api.Duration(options.TTL),
-				ExtensionDeadline: api.Duration(options.ExtensionDeadline),
+				Expiry:            api.Duration(options.Expiry),
+				InactivityTimeout: api.Duration(options.InactivityTimeout),
 			})
 			if err != nil {
 				if api.ErrorStatusCode(err) == 403 {
@@ -98,15 +122,32 @@ $ infra keys add connector
 				return err
 			}
 
+			if options.Quiet {
+				cli.Output(resp.AccessKey)
+				return nil
+			}
+
 			var expMsg strings.Builder
 			expMsg.WriteString("This key will expire in ")
-			expMsg.WriteString(ExactDuration(options.TTL))
-			if !resp.Expires.Equal(resp.ExtensionDeadline) {
+			if options.Expiry == oneYear {
+				expMsg.WriteString("1 year")
+			} else {
+				expMsg.WriteString(format.ExactDuration(options.Expiry))
+			}
+			if !resp.Expires.Equal(resp.InactivityTimeout) {
 				expMsg.WriteString(", and must be used every ")
-				expMsg.WriteString(ExactDuration(options.ExtensionDeadline))
+				if options.InactivityTimeout == thirtyDays {
+					expMsg.WriteString("30 days")
+				} else {
+					expMsg.WriteString(format.ExactDuration(options.InactivityTimeout))
+				}
 				expMsg.WriteString(" to remain valid")
 			}
-			cli.Output("Issued access key %q for %q", resp.Name, userName)
+			if options.UserName != "" {
+				cli.Output("Issued access key %q for %q", resp.Name, options.UserName)
+			} else {
+				cli.Output("Issued access key %q", resp.Name)
+			}
 			cli.Output(expMsg.String())
 			cli.Output("")
 
@@ -116,14 +157,22 @@ $ infra keys add connector
 	}
 
 	cmd.Flags().StringVar(&options.Name, "name", "", "The name of the access key")
-	cmd.Flags().DurationVar(&options.TTL, "ttl", thirtyDays, "The total time that the access key will be valid for")
-	cmd.Flags().DurationVar(&options.ExtensionDeadline, "extension-deadline", thirtyDays, "A specified deadline that the access key must be used within to remain valid")
+	cmd.Flags().StringVar(&options.UserName, "user", "", "The name of the user who will own the key")
+	cmd.Flags().BoolVar(&options.Connector, "connector", false, "Create the key for the connector")
+	cmd.Flags().BoolVarP(&options.Quiet, "quiet", "q", false, "Only display the access key")
+	cmd.Flags().DurationVar(&options.Expiry, "expiry", oneYear, "The total time that the access key will be valid for")
+	cmd.Flags().DurationVar(&options.InactivityTimeout, "inactivity-timeout", thirtyDays, "A specified deadline that the access key must be used within to remain valid")
 
 	return cmd
 }
 
+type keyRemoveOptions struct {
+	Force    bool
+	UserName string
+}
+
 func newKeysRemoveCmd(cli *CLI) *cobra.Command {
-	var force bool
+	var options keyRemoveOptions
 
 	cmd := &cobra.Command{
 		Use:     "remove KEY",
@@ -131,53 +180,70 @@ func newKeysRemoveCmd(cli *CLI) *cobra.Command {
 		Short:   "Delete an access key",
 		Args:    ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
 			client, err := defaultAPIClient()
 			if err != nil {
 				return err
 			}
 
-			logging.Debugf("call server: list access keys named %q", args[0])
-			keys, err := client.ListAccessKeys(api.ListAccessKeysRequest{Name: args[0]})
+			config, err := currentHostConfig()
 			if err != nil {
-				return handleListKeysMissingPrivilege(err)
+				return err
 			}
 
-			if keys.Count == 0 && !force {
-				return Error{Message: fmt.Sprintf("No access keys named %q", args[0])}
-			}
+			keyName := args[0]
+			userID := config.UserID
 
-			logging.Debugf("deleting %d access keys named %q...", keys.Count, args[0])
-			for _, key := range keys.Items {
-				logging.Debugf("...call server: delete access key %s", key.ID)
-				err = client.DeleteAccessKey(key.ID)
+			if options.UserName != "" {
+				user, err := getUserByNameOrID(client, options.UserName)
 				if err != nil {
 					if api.ErrorStatusCode(err) == 403 {
 						logging.Debugf("%s", err.Error())
 						return Error{
-							Message: "Cannot delete key: missing privileges for DeleteKey",
+							Message: "Cannot list keys: missing privileges for GetUser",
 						}
 					}
 					return err
 				}
-
-				issuedFor := key.IssuedForName
-				if issuedFor == "" {
-					issuedFor = key.IssuedFor.String()
-				}
-
-				cli.Output("Removed access key %q issued for %q", key.Name, issuedFor)
+				userID = user.ID
 			}
+
+			keys, err := listAll(ctx, client.ListAccessKeys, api.ListAccessKeysRequest{Name: keyName, UserID: userID})
+			if err != nil {
+				return err
+			}
+
+			if len(keys) == 0 {
+				return Error{
+					Message: "No access key named: " + keyName,
+				}
+			}
+
+			err = client.DeleteAccessKey(ctx, keys[0].ID)
+			if err != nil {
+				if api.ErrorStatusCode(err) == 403 {
+					logging.Debugf("%s", err.Error())
+					return Error{
+						Message: "Cannot delete key: missing privileges for DeleteKey",
+					}
+				}
+				return err
+			}
+
+			cli.Output("Removed access key %q", args[0])
 
 			return nil
 		},
 	}
 
-	cmd.Flags().BoolVar(&force, "force", false, "Exit successfully even if access key does not exist")
+	cmd.Flags().BoolVar(&options.Force, "force", false, "Exit successfully even if access key does not exist")
+	cmd.Flags().StringVar(&options.UserName, "user", "", "The name of the user who owns the key")
 
 	return cmd
 }
 
 type keyListOptions struct {
+	AllUsers    bool
 	UserName    string
 	ShowExpired bool
 }
@@ -196,34 +262,52 @@ func newKeysListCmd(cli *CLI) *cobra.Command {
 				return err
 			}
 
-			var keys []api.AccessKey
-			var userID uid.ID
-			if options.UserName != "" {
-				user, err := getUserByNameOrID(client, options.UserName)
-				if err != nil {
-					if api.ErrorStatusCode(err) == 403 {
-						logging.Debugf("%s", err.Error())
-						return Error{
-							Message: "Cannot list keys: missing privileges for GetUser",
-						}
-					}
-					return err
-				}
-				userID = user.ID
-			}
+			ctx := context.Background()
 
-			logging.Debugf("call server: list access keys")
-			keys, err = listAll(client.ListAccessKeys, api.ListAccessKeysRequest{ShowExpired: options.ShowExpired, UserID: userID})
+			config, err := currentHostConfig()
 			if err != nil {
 				return err
 			}
 
+			var keys []api.AccessKey
+			userID := config.UserID
+
+			if options.UserName != "" {
+				if options.UserName == config.Name { // user is requesting their own stuff
+					userID = config.UserID
+				} else {
+					user, err := getUserByNameOrID(client, options.UserName)
+					if err != nil {
+						if api.ErrorStatusCode(err) == 403 {
+							logging.Debugf("%s", err.Error())
+							return Error{
+								Message: "Cannot list keys: missing privileges for GetUser",
+							}
+						}
+						return err
+					}
+					userID = user.ID
+				}
+			}
+
+			if options.AllUsers {
+				userID = 0
+			}
+
+			logging.Debugf("call server: list access keys")
+			keys, err = listAll(ctx, client.ListAccessKeys, api.ListAccessKeysRequest{ShowExpired: options.ShowExpired, UserID: userID})
+			if err != nil {
+				return err
+			}
+
+			// TODO: remove IssuedFor unless the user is getting access keys for a different user or using --all
 			type row struct {
 				Name              string `header:"NAME"`
 				IssuedFor         string `header:"ISSUED FOR"`
 				Created           string `header:"CREATED"`
+				LastUsed          string `header:"LAST USED"`
 				Expires           string `header:"EXPIRES"`
-				ExtensionDeadline string `header:"EXTENSION DEADLINE"`
+				InactivityTimeout string `header:"INACTIVITY TIMEOUT"`
 			}
 
 			var rows []row
@@ -235,9 +319,10 @@ func newKeysListCmd(cli *CLI) *cobra.Command {
 				rows = append(rows, row{
 					Name:              k.Name,
 					IssuedFor:         name,
-					Created:           HumanTime(k.Created.Time(), "never"),
-					Expires:           HumanTime(k.Expires.Time(), "never"),
-					ExtensionDeadline: HumanTime(k.ExtensionDeadline.Time(), "never"),
+					Created:           format.HumanTime(k.Created.Time(), "never"),
+					LastUsed:          format.HumanTime(k.LastUsed.Time(), "never"),
+					Expires:           format.HumanTime(k.Expires.Time(), "never"),
+					InactivityTimeout: format.HumanTime(k.InactivityTimeout.Time(), "never"),
 				})
 			}
 
@@ -251,17 +336,8 @@ func newKeysListCmd(cli *CLI) *cobra.Command {
 		},
 	}
 
+	cmd.Flags().BoolVar(&options.AllUsers, "all", false, "Show keys for all users")
 	cmd.Flags().StringVar(&options.UserName, "user", "", "The name of a user to list access keys for")
 	cmd.Flags().BoolVar(&options.ShowExpired, "show-expired", false, "Show expired access keys")
 	return cmd
-}
-
-func handleListKeysMissingPrivilege(err error) error {
-	if api.ErrorStatusCode(err) == 403 {
-		logging.Debugf("%s", err.Error())
-		return Error{
-			Message: "Cannot list keys: missing privileges for ListKeys",
-		}
-	}
-	return err
 }

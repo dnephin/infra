@@ -2,64 +2,105 @@ package data
 
 import (
 	"errors"
+	"fmt"
 	"time"
-
-	"gorm.io/gorm"
 
 	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/generate"
 	"github.com/infrahq/infra/internal/logging"
+	"github.com/infrahq/infra/internal/server/data/querybuilder"
 	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/uid"
 )
 
-func CreatePasswordResetToken(db GormTxn, user *models.Identity, ttl time.Duration) (*models.PasswordResetToken, error) {
+type passwordResetToken struct {
+	ID uid.ID
+	models.OrganizationMember
+
+	Token      string
+	IdentityID uid.ID
+	ExpiresAt  time.Time
+}
+
+func (passwordResetToken) Table() string {
+	return "password_reset_tokens"
+}
+
+func (p passwordResetToken) Columns() []string {
+	return []string{"expires_at", "id", "identity_id", "organization_id", "token"}
+}
+
+func (p passwordResetToken) Values() []any {
+	return []any{p.ExpiresAt, p.ID, p.IdentityID, p.OrganizationID, p.Token}
+}
+
+func (p *passwordResetToken) ScanFields() []any {
+	return []any{&p.ExpiresAt, &p.ID, &p.IdentityID, &p.OrganizationID, &p.Token}
+}
+
+func (p *passwordResetToken) OnInsert() error {
+	return nil
+}
+
+func CreatePasswordResetToken(tx WriteTxn, userID uid.ID, expiry time.Duration) (string, error) {
+	if userID == 0 || expiry == 0 {
+		return "", fmt.Errorf("a userID and expiry are required")
+	}
+
 	tries := 0
+	var ucErr UniqueConstraintError
+
 retry:
 	token, err := generate.CryptoRandom(10, generate.CharsetAlphaNumeric)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	prt := &models.PasswordResetToken{
+	prt := &passwordResetToken{
 		ID:         uid.New(),
 		Token:      token,
-		IdentityID: user.ID,
-		ExpiresAt:  time.Now().Add(ttl).UTC(),
+		IdentityID: userID,
+		ExpiresAt:  time.Now().Add(expiry).UTC(),
 	}
 
 	tries++
-	if err = save(db, prt); err != nil {
-		if tries <= 3 && errors.Is(err, UniqueConstraintError{}) {
+	if err = insert(tx, prt); err != nil {
+		if tries <= 3 && errors.As(err, &ucErr) {
 			logging.Warnf("generated random token %q already exists in the database", token)
 			goto retry // on the off chance the token exists.
 		}
-		return nil, err
+		return "", err
 	}
 
-	return prt, nil
+	return prt.Token, nil
 }
 
-func GetPasswordResetTokenByToken(db GormTxn, token string) (*models.PasswordResetToken, error) {
-	prts, err := list[models.PasswordResetToken](db, &Pagination{Limit: 1}, func(db *gorm.DB) *gorm.DB {
-		return db.Where("token = ?", token)
-	})
+// ClaimPasswordResetToken deletes the password reset token, and returns the
+// user ID that was associated with the token. Returns an error if the token
+// does not exist or has expired.
+func ClaimPasswordResetToken(tx WriteTxn, token string) (uid.ID, error) {
+	stmt := `
+		DELETE from password_reset_tokens
+		WHERE token = ? AND organization_id = ?
+		RETURNING identity_id, expires_at`
+
+	var userID uid.ID
+	var expiresAt time.Time
+	err := tx.QueryRow(stmt, token, tx.OrganizationID()).Scan(&userID, &expiresAt)
 	if err != nil {
-		return nil, err
+		return 0, handleError(err)
 	}
 
-	if len(prts) != 1 {
-		return nil, internal.ErrNotFound
+	if expiresAt.Before(time.Now()) {
+		return 0, internal.ErrExpired
 	}
-
-	if prts[0].ExpiresAt.Before(time.Now()) {
-		_ = DeletePasswordResetToken(db, &prts[0])
-		return nil, internal.ErrExpired
-	}
-
-	return &prts[0], nil
+	return userID, nil
 }
 
-func DeletePasswordResetToken(db GormTxn, prt *models.PasswordResetToken) error {
-	return delete[models.PasswordResetToken](db, prt.ID)
+func RemoveExpiredPasswordResetTokens(tx WriteTxn) error {
+	query := querybuilder.New("DELETE FROM password_reset_tokens")
+	query.B("WHERE expires_at <= ?", time.Now().UTC())
+
+	_, err := tx.Exec(query.String(), query.Args...)
+	return err
 }

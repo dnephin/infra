@@ -17,13 +17,19 @@ type Identity struct {
 	Model
 	OrganizationMember
 
-	Name       string    `gorm:"uniqueIndex:idx_identities_name,where:deleted_at is NULL"`
-	LastSeenAt time.Time // updated on when an identity uses a session token
-	CreatedBy  uid.ID
+	Name              string
+	LastSeenAt        time.Time // updated on when an identity uses a session token
+	CreatedBy         uid.ID
+	Verified          bool
+	VerificationToken string
 
-	// for eager loading, don't use these for saving.
-	Groups    []Group    `gorm:"many2many:identities_groups"`
-	Providers []Provider `gorm:"many2many:provider_users;"`
+	// Groups may be populated by some queries to contain the list of groups
+	// the user is a member of.  Some test helpers may also use this to add
+	// users to groups, but data.CreateUser does not read this field.
+	Groups []Group `db:"-"`
+	// Providers may be populated by some queries to contain the list of
+	// providers that provide this user.
+	Providers []Provider `db:"-"`
 }
 
 func (i *Identity) ToAPI() *api.User {

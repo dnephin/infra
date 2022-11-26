@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"context"
+	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
@@ -31,18 +33,20 @@ func TestListCmd(t *testing.T) {
 			{User: "admin", Resource: "infra", Role: "admin"},
 			{User: "manygrants@example.com", Resource: "space", Role: "explorer"},
 			{User: "manygrants@example.com", Resource: "moon", Role: "inhabitant"},
+			{User: "manygrants@example.com", Resource: "infra-this-is-not", Role: "view"},
 		},
 	}
 	setupServerOptions(t, &opts)
 	srv, err := server.New(opts)
 	assert.NilError(t, err)
 
-	ctx := runAndWait(t, srv.Run)
+	ctx := context.Background()
+	runAndWait(ctx, t, srv.Run)
 
 	httpTransport := httpTransportForHostConfig(&ClientHostConfig{SkipTLSVerify: true})
 	c := apiClient(srv.Addrs.HTTPS.String(), "0000000001.adminadminadminadmin1234", httpTransport)
 
-	_, err = c.CreateDestination(&api.CreateDestinationRequest{
+	_, err = c.CreateDestination(ctx, &api.CreateDestinationRequest{
 		UniqueID: "space",
 		Name:     "space",
 		Connection: api.DestinationConnection{
@@ -52,7 +56,7 @@ func TestListCmd(t *testing.T) {
 	})
 	assert.NilError(t, err)
 
-	_, err = c.CreateDestination(&api.CreateDestinationRequest{
+	_, err = c.CreateDestination(ctx, &api.CreateDestinationRequest{
 		UniqueID: "moon",
 		Name:     "moon",
 		Connection: api.DestinationConnection{
@@ -62,7 +66,30 @@ func TestListCmd(t *testing.T) {
 	})
 	assert.NilError(t, err)
 
-	users, err := c.ListUsers(api.ListUsersRequest{})
+	_, err = c.CreateDestination(ctx, &api.CreateDestinationRequest{
+		UniqueID: "maintain",
+		Name:     "infra-this-is-not",
+		Connection: api.DestinationConnection{
+			URL: "http://localhost:10126/",
+			CA:  destinationCA,
+		},
+	})
+	assert.NilError(t, err)
+
+	for _, uniqueID := range []string{"space", "moon", "maintain"} {
+		// set client.Headers so each destination becomes connected
+		c.Headers = http.Header{
+			"Infra-Destination": {uniqueID},
+		}
+
+		_, err := c.ListGrants(ctx, api.ListGrantsRequest{})
+		assert.NilError(t, err)
+	}
+
+	// reset client.Headers
+	c.Headers = http.Header{}
+
+	users, err := c.ListUsers(ctx, api.ListUsersRequest{})
 	assert.NilError(t, err)
 
 	userMap := usersToMap(users.Items)

@@ -36,7 +36,7 @@ func newAuthenticator(url string, options Options) *authenticator {
 	return &authenticator{
 		client:          &http.Client{Transport: transport},
 		baseURL:         url,
-		serverAccessKey: options.Server.AccessKey,
+		serverAccessKey: options.Server.AccessKey.String(),
 	}
 }
 
@@ -103,6 +103,10 @@ func (j *authenticator) getJWK() (*jose.JSONWebKey, error) {
 		return nil, err
 	}
 	defer res.Body.Close()
+
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, fmt.Errorf("unexpected response: %v ", res.Status)
+	}
 
 	data, err := ioutil.ReadAll(res.Body)
 	if err != nil {

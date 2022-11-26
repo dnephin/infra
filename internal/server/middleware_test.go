@@ -28,15 +28,9 @@ import (
 
 func setupDB(t *testing.T) *data.DB {
 	t.Helper()
-	driver := database.PostgresDriver(t, "_server")
-	if driver == nil {
-		lite, err := data.NewSQLiteDriver("file::memory:")
-		assert.NilError(t, err)
-		driver = &database.Driver{Dialector: lite}
-	}
-
 	tpatch.ModelsSymmetricKey(t)
-	db, err := data.NewDB(driver.Dialector, nil)
+
+	db, err := data.NewDB(data.NewDBOptions{DSN: database.PostgresDriver(t, "_server").DSN})
 	assert.NilError(t, err)
 	t.Cleanup(func() {
 		assert.NilError(t, db.Close())
@@ -45,7 +39,7 @@ func setupDB(t *testing.T) *data.DB {
 	return db
 }
 
-func issueToken(t *testing.T, db data.GormTxn, identityName string, sessionDuration time.Duration) string {
+func issueToken(t *testing.T, db data.WriteTxn, identityName string, sessionDuration time.Duration) string {
 	user := &models.Identity{Name: identityName}
 
 	err := data.CreateIdentity(db, user)
@@ -64,69 +58,14 @@ func issueToken(t *testing.T, db data.GormTxn, identityName string, sessionDurat
 	return body
 }
 
-func TestRequestTimeoutError(t *testing.T) {
-	router := gin.New()
-	router.Use(TimeoutMiddleware(100 * time.Millisecond))
-	router.GET("/", func(c *gin.Context) {
-		time.Sleep(110 * time.Millisecond)
-
-		assert.ErrorIs(t, c.Request.Context().Err(), context.DeadlineExceeded)
-
-		c.Status(200)
-	})
-	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
-}
-
-func TestRequestTimeoutSuccess(t *testing.T) {
-	router := gin.New()
-	router.Use(TimeoutMiddleware(60 * time.Second))
-	router.GET("/", func(c *gin.Context) {
-		assert.NilError(t, c.Request.Context().Err())
-
-		c.Status(200)
-	})
-	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
-}
-
-func TestDBTimeout(t *testing.T) {
-	var ctx context.Context
-	var cancel context.CancelFunc
-
-	srv := newServer(Options{})
-	srv.db = setupDB(t)
-
-	router := gin.New()
-	router.Use(
-		func(c *gin.Context) {
-			// this is a custom copy of the timeout middleware so I can grab and control the cancel() func. Otherwise the test is too flakey with timing race conditions.
-			ctx, cancel = context.WithTimeout(c.Request.Context(), 100*time.Millisecond)
-			defer cancel()
-
-			c.Request = c.Request.WithContext(ctx)
-			c.Next()
-		},
-		unauthenticatedMiddleware(srv),
-	)
-	router.GET("/", func(c *gin.Context) {
-		rCtx := getRequestContext(c)
-		db := rCtx.DBTxn
-		cancel()
-		_, err := db.Exec("select 1;")
-		assert.Error(t, err, "context canceled")
-
-		c.Status(200)
-	})
-	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
-}
-
 func TestRequireAccessKey(t *testing.T) {
 	type testCase struct {
-		setup    func(t *testing.T, db data.GormTxn) *http.Request
+		setup    func(t *testing.T, db data.WriteTxn) *http.Request
 		expected func(t *testing.T, authned access.Authenticated, err error)
 	}
 	cases := map[string]testCase{
 		"AccessKeyValid": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				authentication := issueToken(t, db, "existing@infrahq.com", time.Minute*1)
 				r := httptest.NewRequest(http.MethodGet, "/", nil)
 				r.Header.Add("Authorization", "Bearer "+authentication)
@@ -137,8 +76,50 @@ func TestRequireAccessKey(t *testing.T) {
 				assert.Equal(t, actual.User.Name, "existing@infrahq.com")
 			},
 		},
+		"AccessKeyValidForProvider": {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
+				provider := data.InfraProvider(db)
+				token := &models.AccessKey{
+					IssuedFor:  provider.ID,
+					ProviderID: provider.ID,
+					Name:       fmt.Sprintf("%s-scim", provider.Name),
+					ExpiresAt:  time.Now().Add(1 * time.Minute).UTC(),
+				}
+				authentication, err := data.CreateAccessKey(db, token)
+				assert.NilError(t, err)
+				r := httptest.NewRequest(http.MethodGet, "/", nil)
+				r.Header.Add("Authorization", "Bearer "+authentication)
+				return r
+			},
+			expected: func(t *testing.T, actual access.Authenticated, err error) {
+				assert.NilError(t, err)
+				assert.Assert(t, actual.User == nil)
+			},
+		},
+		"AccessKeyInvalidForProviderNotMatchingIssuedAndProvider": {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
+				provider := data.InfraProvider(db)
+				token := &models.AccessKey{
+					IssuedFor: provider.ID,
+					Name:      fmt.Sprintf("%s-scim", provider.Name),
+					ExpiresAt: time.Now().Add(1 * time.Minute).UTC(),
+				}
+				authentication, err := data.CreateAccessKey(db, token)
+				assert.NilError(t, err)
+				token.ProviderID = 123
+				err = data.UpdateAccessKey(db, token)
+				assert.NilError(t, err)
+
+				r := httptest.NewRequest(http.MethodGet, "/", nil)
+				r.Header.Add("Authorization", "Bearer "+authentication)
+				return r
+			},
+			expected: func(t *testing.T, actual access.Authenticated, err error) {
+				assert.ErrorContains(t, err, "identity for access key: record not found")
+			},
+		},
 		"ValidAuthCookie": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				authentication := issueToken(t, db, "existing@infrahq.com", time.Minute*1)
 
 				r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -162,7 +143,7 @@ func TestRequireAccessKey(t *testing.T) {
 			},
 		},
 		"ValidSignupCookie": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				authentication := issueToken(t, db, "existing@infrahq.com", time.Minute*1)
 
 				r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -186,7 +167,7 @@ func TestRequireAccessKey(t *testing.T) {
 			},
 		},
 		"SignupCookieIsUsedOverAuthCookie": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				authentication := issueToken(t, db, "existing@infrahq.com", time.Minute*1)
 
 				r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -220,7 +201,7 @@ func TestRequireAccessKey(t *testing.T) {
 			},
 		},
 		"AccessKeyExpired": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				authentication := issueToken(t, db, "existing@infrahq.com", time.Minute*-1)
 				r := httptest.NewRequest(http.MethodGet, "/", nil)
 				r.Header.Add("Authorization", "Bearer "+authentication)
@@ -231,7 +212,7 @@ func TestRequireAccessKey(t *testing.T) {
 			},
 		},
 		"AccessKeyInvalidKey": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				token := issueToken(t, db, "existing@infrahq.com", time.Minute*1)
 				secret := token[:models.AccessKeySecretLength]
 				authentication := fmt.Sprintf("%s.%s", uid.New().String(), secret)
@@ -244,7 +225,7 @@ func TestRequireAccessKey(t *testing.T) {
 			},
 		},
 		"AccessKeyNoMatch": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				authentication := fmt.Sprintf("%s.%s", uid.New().String(), generate.MathRandom(models.AccessKeySecretLength, generate.CharsetAlphaNumeric))
 				r := httptest.NewRequest(http.MethodGet, "/", nil)
 				r.Header.Add("Authorization", "Bearer "+authentication)
@@ -255,7 +236,7 @@ func TestRequireAccessKey(t *testing.T) {
 			},
 		},
 		"AccessKeyInvalidSecret": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				token := issueToken(t, db, "existing@infrahq.com", time.Minute*1)
 				authentication := fmt.Sprintf("%s.%s", strings.Split(token, ".")[0], generate.MathRandom(models.AccessKeySecretLength, generate.CharsetAlphaNumeric))
 				r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -267,7 +248,7 @@ func TestRequireAccessKey(t *testing.T) {
 			},
 		},
 		"UnknownAuthenticationMethod": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				authentication, err := generate.CryptoRandom(32, generate.CharsetAlphaNumeric)
 				assert.NilError(t, err)
 				r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -279,7 +260,7 @@ func TestRequireAccessKey(t *testing.T) {
 			},
 		},
 		"NoAuthentication": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				// nil pointer if we don't seup the request header here
 				r := httptest.NewRequest(http.MethodGet, "/", nil)
 				return r
@@ -289,7 +270,7 @@ func TestRequireAccessKey(t *testing.T) {
 			},
 		},
 		"EmptyAuthentication": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "/", nil)
 				r.Header.Add("Authorization", "")
 				return r
@@ -299,7 +280,7 @@ func TestRequireAccessKey(t *testing.T) {
 			},
 		},
 		"EmptySpaceAuthentication": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "/", nil)
 				r.Header.Add("Authorization", " ")
 				return r
@@ -309,7 +290,7 @@ func TestRequireAccessKey(t *testing.T) {
 			},
 		},
 		"EmptyCookieAuthentication": {
-			setup: func(t *testing.T, db data.GormTxn) *http.Request {
+			setup: func(t *testing.T, db data.WriteTxn) *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "/", nil)
 
 				r.AddCookie(&http.Cookie{
@@ -344,7 +325,8 @@ func TestRequireAccessKey(t *testing.T) {
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			c.Request = req
 
-			authned, err := requireAccessKey(c, db, srv)
+			tx := txnForTestCase(t, db, db.DefaultOrg.ID)
+			authned, err := requireAccessKey(c, tx, srv)
 			tc.expected(t, authned, err)
 		})
 	}
@@ -375,24 +357,67 @@ func TestHandleInfraDestinationHeader(t *testing.T) {
 	secret, err := data.CreateAccessKey(db, &token)
 	assert.NilError(t, err)
 
-	t.Run("good", func(t *testing.T) {
-		destination := &models.Destination{Name: t.Name(), UniqueID: t.Name()}
+	t.Run("with uniqueID", func(t *testing.T) {
+		destination := &models.Destination{
+			Name:     t.Name(),
+			UniqueID: "the-unique-id",
+			Kind:     models.DestinationKindKubernetes,
+		}
 		err := data.CreateDestination(db, destination)
 		assert.NilError(t, err)
 
-		r := httptest.NewRequest("GET", "/api/grants", nil)
-		r.Header.Add("Infra-Destination", destination.UniqueID)
-		r.Header.Add("Authorization", fmt.Sprintf("Bearer %s", secret))
-		w := httptest.NewRecorder()
-		routes.ServeHTTP(w, r)
+		doRequest := func() {
+			r := httptest.NewRequest("GET", "/api/grants", nil)
+			r.Header.Set("Infra-Version", apiVersionLatest)
+			r.Header.Set(headerInfraDestinationUniqueID, destination.UniqueID)
+			r.Header.Set("Authorization", fmt.Sprintf("Bearer %s", secret))
+			w := httptest.NewRecorder()
+			routes.ServeHTTP(w, r)
+		}
 
-		destination, err = data.GetDestination(db, data.ByOptionalUniqueID(destination.UniqueID))
+		doRequest()
+		destination, err = data.GetDestination(db, data.GetDestinationOptions{ByUniqueID: destination.UniqueID})
+		assert.NilError(t, err)
+		assert.DeepEqual(t, destination.LastSeenAt, time.Now(), opt.TimeWithThreshold(time.Second))
+
+		// check LastSeenAt updates are throttled
+		time.Sleep(20 * time.Millisecond)
+		doRequest()
+		updated, err := data.GetDestination(db, data.GetDestinationOptions{ByUniqueID: destination.UniqueID})
+		assert.NilError(t, err)
+		assert.Equal(t, destination.LastSeenAt, updated.LastSeenAt,
+			"expected no updated to LastSeenAt")
+	})
+
+	t.Run("with name", func(t *testing.T) {
+		destination := &models.Destination{
+			Name: "the-destination-name",
+			Kind: models.DestinationKindKubernetes,
+		}
+		err := data.CreateDestination(db, destination)
+		assert.NilError(t, err)
+
+		doRequest := func() {
+			r := httptest.NewRequest("GET", "/api/grants", nil)
+			r.Header.Set("Infra-Version", apiVersionLatest)
+			r.Header.Set(headerInfraDestinationName, destination.Name)
+			r.Header.Set("Authorization", fmt.Sprintf("Bearer %s", secret))
+			w := httptest.NewRecorder()
+			routes.ServeHTTP(w, r)
+		}
+
+		doRequest()
+		destination, err = data.GetDestination(db, data.GetDestinationOptions{ByName: destination.Name})
 		assert.NilError(t, err)
 		assert.DeepEqual(t, destination.LastSeenAt, time.Now(), opt.TimeWithThreshold(time.Second))
 	})
 
 	t.Run("good no destination header", func(t *testing.T) {
-		destination := &models.Destination{Name: t.Name(), UniqueID: t.Name()}
+		destination := &models.Destination{
+			Name:     t.Name(),
+			UniqueID: t.Name(),
+			Kind:     models.DestinationKindKubernetes,
+		}
 		err := data.CreateDestination(db, destination)
 		assert.NilError(t, err)
 
@@ -401,7 +426,7 @@ func TestHandleInfraDestinationHeader(t *testing.T) {
 		w := httptest.NewRecorder()
 		routes.ServeHTTP(w, r)
 
-		destination, err = data.GetDestination(db, data.ByOptionalUniqueID(destination.UniqueID))
+		destination, err = data.GetDestination(db, data.GetDestinationOptions{ByUniqueID: destination.UniqueID})
 		assert.NilError(t, err)
 		assert.Equal(t, destination.LastSeenAt.UTC(), time.Time{})
 	})
@@ -413,14 +438,13 @@ func TestHandleInfraDestinationHeader(t *testing.T) {
 		w := httptest.NewRecorder()
 		routes.ServeHTTP(w, r)
 
-		_, err := data.GetDestination(db, data.ByOptionalUniqueID("nonexistent"))
+		_, err := data.GetDestination(db, data.GetDestinationOptions{ByUniqueID: "nonexistent"})
 		assert.ErrorIs(t, err, internal.ErrNotFound)
 	})
 }
 
-func TestAuthenticatedMiddleware(t *testing.T) {
+func TestAuthenticateRequest(t *testing.T) {
 	srv := setupServer(t, withAdminUser)
-	db := srv.DB()
 	routes := srv.GenerateRoutes()
 
 	org := &models.Organization{
@@ -431,24 +455,30 @@ func TestAuthenticatedMiddleware(t *testing.T) {
 		Name:   "The Factory",
 		Domain: "the-factory-xyz8.infrahq.com",
 	}
-	createOrgs(t, db, otherOrg, org)
-	db = data.NewTransaction(db.GormDB(), org.ID)
+	createOrgs(t, srv.db, otherOrg, org)
+
+	tx, err := srv.db.Begin(context.Background(), nil)
+	assert.NilError(t, err)
+	tx = tx.WithOrgID(org.ID)
 
 	user := &models.Identity{
 		Name:               "userone@example.com",
 		OrganizationMember: models.OrganizationMember{OrganizationID: org.ID},
 	}
-	createIdentities(t, db, user)
+	createIdentities(t, tx, user)
 
 	token := &models.AccessKey{
-		IssuedFor:          user.ID,
-		ProviderID:         data.InfraProvider(db).ID,
-		ExpiresAt:          time.Now().Add(10 * time.Second),
-		OrganizationMember: models.OrganizationMember{OrganizationID: org.ID},
+		IssuedFor:           user.ID,
+		ProviderID:          data.InfraProvider(tx).ID,
+		ExpiresAt:           time.Now().Add(10 * time.Second),
+		InactivityExtension: time.Hour,
+		OrganizationMember:  models.OrganizationMember{OrganizationID: org.ID},
 	}
 
-	key, err := data.CreateAccessKey(db, token)
+	key, err := data.CreateAccessKey(tx, token)
 	assert.NilError(t, err)
+
+	assert.NilError(t, tx.Commit())
 
 	httpSrv := httptest.NewServer(routes)
 	t.Cleanup(httpSrv.Close)
@@ -458,6 +488,8 @@ func TestAuthenticatedMiddleware(t *testing.T) {
 		setup    func(t *testing.T, req *http.Request)
 		expected func(t *testing.T, resp *http.Response)
 	}
+
+	var now time.Time
 
 	run := func(t *testing.T, tc testCase) {
 		// Any authenticated route will do
@@ -532,6 +564,69 @@ func TestAuthenticatedMiddleware(t *testing.T) {
 				assert.Equal(t, resp.StatusCode, http.StatusBadRequest)
 			},
 		},
+		{
+			name: "LastSeenAt and InactivityTimeout are updated",
+			setup: func(t *testing.T, req *http.Request) {
+				tx := txnForTestCase(t, srv.db, org.ID)
+				user := *user // shallow copy user
+				user.LastSeenAt = time.Date(2022, 1, 2, 3, 4, 5, 0, time.UTC)
+				assert.NilError(t, data.UpdateIdentity(tx, &user))
+
+				ak := *token // shallow copy access key
+				ak.InactivityTimeout = time.Now().Add(2 * time.Minute)
+				assert.NilError(t, data.UpdateAccessKey(tx, &ak))
+
+				assert.NilError(t, tx.Commit())
+
+				req.Header.Set("Authorization", "Bearer "+key)
+			},
+			expected: func(t *testing.T, resp *http.Response) {
+				assert.Equal(t, resp.StatusCode, http.StatusOK, resp)
+
+				tx := txnForTestCase(t, srv.db, org.ID)
+				user, err := data.GetIdentity(tx, data.GetIdentityOptions{ByID: user.ID})
+				assert.NilError(t, err)
+				assert.DeepEqual(t, user.LastSeenAt, time.Now(), opt.TimeWithThreshold(time.Second))
+
+				ak, err := data.GetAccessKey(tx, data.GetAccessKeysOptions{ByID: token.ID})
+				assert.NilError(t, err)
+				assert.DeepEqual(t, ak.InactivityTimeout, time.Now().Add(token.InactivityExtension),
+					opt.TimeWithThreshold(time.Second))
+			},
+		},
+		{
+			name: "LastSeenAt and InactivityTimeout updates are throttled",
+			setup: func(t *testing.T, req *http.Request) {
+				now = time.Now().Truncate(time.Microsecond) // truncate to DB precision
+
+				tx := txnForTestCase(t, srv.db, org.ID)
+				user := *user // shallow copy user
+				user.LastSeenAt = now
+				assert.NilError(t, data.UpdateIdentity(tx, &user))
+
+				ak := *token // shallow copy access key
+				ak.InactivityTimeout = now.Add(ak.InactivityExtension)
+				assert.NilError(t, data.UpdateAccessKey(tx, &ak))
+
+				assert.NilError(t, tx.Commit())
+
+				time.Sleep(20 * time.Millisecond)
+				req.Header.Set("Authorization", "Bearer "+key)
+			},
+			expected: func(t *testing.T, resp *http.Response) {
+				assert.Equal(t, resp.StatusCode, http.StatusOK, resp)
+
+				tx := txnForTestCase(t, srv.db, org.ID)
+				user, err := data.GetIdentity(tx, data.GetIdentityOptions{ByID: user.ID})
+				assert.NilError(t, err)
+				assert.Equal(t, user.LastSeenAt, now, "expected no update")
+
+				ak, err := data.GetAccessKey(tx, data.GetAccessKeysOptions{ByID: token.ID})
+				assert.NilError(t, err)
+				assert.Equal(t, ak.InactivityTimeout, now.Add(token.InactivityExtension),
+					"expected no update")
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -541,10 +636,10 @@ func TestAuthenticatedMiddleware(t *testing.T) {
 	}
 }
 
-func TestUnauthenticatedMiddleware(t *testing.T) {
+func TestValidateRequestOrganization(t *testing.T) {
 	srv := setupServer(t, withAdminUser)
 	srv.options.EnableSignup = true // multi-tenant environment
-	db := srv.DB()
+	srv.options.BaseDomain = "example.com"
 	routes := srv.GenerateRoutes()
 
 	org := &models.Organization{
@@ -555,31 +650,36 @@ func TestUnauthenticatedMiddleware(t *testing.T) {
 		Name:   "The Factory",
 		Domain: "the-factory-xyz8.infrahq.com",
 	}
-	createOrgs(t, db, otherOrg, org)
-	db = data.NewTransaction(db.GormDB(), org.ID)
+	createOrgs(t, srv.db, otherOrg, org)
+
+	tx, err := srv.db.Begin(context.Background(), nil)
+	assert.NilError(t, err)
+	tx = tx.WithOrgID(org.ID)
 
 	provider := &models.Provider{
 		Name:               "electric",
 		Kind:               models.ProviderKindGoogle,
 		OrganizationMember: models.OrganizationMember{OrganizationID: org.ID},
 	}
-	assert.NilError(t, data.CreateProvider(db, provider))
+	assert.NilError(t, data.CreateProvider(tx, provider))
 
 	user := &models.Identity{
 		Name:               "userone@example.com",
 		OrganizationMember: models.OrganizationMember{OrganizationID: org.ID},
 	}
-	createIdentities(t, db, user)
+	createIdentities(t, tx, user)
 
 	token := &models.AccessKey{
 		IssuedFor:          user.ID,
-		ProviderID:         data.InfraProvider(db).ID,
+		ProviderID:         data.InfraProvider(tx).ID,
 		ExpiresAt:          time.Now().Add(10 * time.Second),
 		OrganizationMember: models.OrganizationMember{OrganizationID: org.ID},
 	}
 
-	key, err := data.CreateAccessKey(db, token)
+	key, err := data.CreateAccessKey(tx, token)
 	assert.NilError(t, err)
+
+	assert.NilError(t, tx.Commit())
 
 	httpSrv := httptest.NewServer(routes)
 	t.Cleanup(httpSrv.Close)

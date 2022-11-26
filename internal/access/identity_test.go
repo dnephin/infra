@@ -53,6 +53,9 @@ func TestDeleteIdentityCleansUpResources(t *testing.T) {
 	err := data.CreateIdentity(db, identity)
 	assert.NilError(t, err)
 
+	_, err = data.CreateProviderUser(db, infraProvider, identity)
+	assert.NilError(t, err)
+
 	// create some resources for this identity
 
 	keyID := generate.MathRandom(models.AccessKeyKeyLength, generate.CharsetAlphaNumeric)
@@ -92,20 +95,23 @@ func TestDeleteIdentityCleansUpResources(t *testing.T) {
 	err = DeleteIdentity(c, identity.ID)
 	assert.NilError(t, err)
 
-	_, err = data.GetIdentity(db, data.ByID(identity.ID))
+	_, err = data.GetIdentity(db, data.GetIdentityOptions{ByID: identity.ID})
 	assert.ErrorIs(t, err, internal.ErrNotFound)
 
-	_, err = data.GetAccessKey(db, data.ByKeyID(keyID))
+	_, err = data.GetProviderUser(db, infraProvider.ID, identity.ID)
 	assert.ErrorIs(t, err, internal.ErrNotFound)
 
-	_, err = data.GetCredential(db, data.ByIdentityID(identity.ID))
+	_, err = data.GetAccessKeyByKeyID(db, keyID)
 	assert.ErrorIs(t, err, internal.ErrNotFound)
 
-	grants, err := data.ListGrants(db, nil, data.BySubject(identity.PolyID()))
+	_, err = data.GetCredentialByUserID(db, identity.ID)
+	assert.ErrorIs(t, err, internal.ErrNotFound)
+
+	grants, err := data.ListGrants(db, data.ListGrantsOptions{BySubject: identity.PolyID()})
 	assert.NilError(t, err)
 	assert.Equal(t, len(grants), 0)
 
-	group, err = data.GetGroup(db, data.ByID(group.ID))
+	group, err = data.GetGroup(db, data.GetGroupOptions{ByID: group.ID})
 	assert.NilError(t, err)
 	assert.Equal(t, group.TotalUsers, 0)
 }

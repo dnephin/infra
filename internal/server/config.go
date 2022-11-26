@@ -11,7 +11,6 @@ import (
 
 	"github.com/infrahq/secrets"
 	"golang.org/x/crypto/bcrypt"
-	"gorm.io/gorm"
 
 	"github.com/infrahq/infra/api"
 	"github.com/infrahq/infra/internal"
@@ -51,7 +50,6 @@ func (p Provider) ValidationRules() []validate.ValidationRule {
 type Grant struct {
 	User     string
 	Group    string
-	Machine  string // deprecated
 	Resource string
 	Role     string
 }
@@ -61,7 +59,6 @@ func (g Grant) ValidationRules() []validate.ValidationRule {
 		validate.RequireOneOf(
 			validate.Field{Name: "user", Value: g.User},
 			validate.Field{Name: "group", Value: g.Group},
-			validate.Field{Name: "machine", Value: g.Machine},
 		),
 		validate.Required("resource", g.Resource),
 	}
@@ -606,60 +603,61 @@ func (s Server) loadConfig(config Config) error {
 	}
 
 	org := s.db.DefaultOrg
-	return s.db.Transaction(func(db *gorm.DB) error {
-		tx := data.NewTransaction(db, org.ID)
 
-		if config.DefaultOrganizationDomain != org.Domain {
-			org.Domain = config.DefaultOrganizationDomain
-			if err := data.UpdateOrganization(tx, org); err != nil {
-				return fmt.Errorf("update default org domain: %w", err)
-			}
+	tx, err := s.db.Begin(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer logError(tx.Rollback, "failed to rollback loadConfig transaction")
+	tx = tx.WithOrgID(org.ID)
+
+	if config.DefaultOrganizationDomain != org.Domain {
+		org.Domain = config.DefaultOrganizationDomain
+		if err := data.UpdateOrganization(tx, org); err != nil {
+			return fmt.Errorf("update default org domain: %w", err)
 		}
+	}
 
-		// inject internal infra provider
-		config.Providers = append(config.Providers, Provider{
-			Name: models.InternalInfraProviderName,
-			Kind: models.ProviderKindInfra.String(),
-		})
-
-		config.Users = append(config.Users, User{
-			Name: models.InternalInfraConnectorIdentityName,
-		})
-
-		config.Grants = append(config.Grants, Grant{
-			User:     models.InternalInfraConnectorIdentityName,
-			Role:     models.InfraConnectorRole,
-			Resource: "infra",
-		})
-
-		if err := s.loadProviders(tx, config.Providers); err != nil {
-			return fmt.Errorf("load providers: %w", err)
-		}
-
-		// extract users from grants and add them to users
-		for _, g := range config.Grants {
-			switch {
-			case g.User != "":
-				config.Users = append(config.Users, User{Name: g.User})
-			case g.Machine != "":
-				logging.Warnf("please update 'machine' grant to 'user', the 'machine' grant type is deprecated and will be removed in a future release")
-				config.Users = append(config.Users, User{Name: g.Machine})
-			}
-		}
-
-		if err := s.loadUsers(tx, config.Users); err != nil {
-			return fmt.Errorf("load users: %w", err)
-		}
-
-		if err := s.loadGrants(tx, config.Grants); err != nil {
-			return fmt.Errorf("load grants: %w", err)
-		}
-
-		return nil
+	// inject internal infra provider
+	config.Providers = append(config.Providers, Provider{
+		Name: models.InternalInfraProviderName,
+		Kind: models.ProviderKindInfra.String(),
 	})
+
+	config.Users = append(config.Users, User{
+		Name: models.InternalInfraConnectorIdentityName,
+	})
+
+	config.Grants = append(config.Grants, Grant{
+		User:     models.InternalInfraConnectorIdentityName,
+		Role:     models.InfraConnectorRole,
+		Resource: "infra",
+	})
+
+	if err := s.loadProviders(tx, config.Providers); err != nil {
+		return fmt.Errorf("load providers: %w", err)
+	}
+
+	// extract users from grants and add them to users
+	for _, g := range config.Grants {
+		switch {
+		case g.User != "":
+			config.Users = append(config.Users, User{Name: g.User})
+		}
+	}
+
+	if err := s.loadUsers(tx, config.Users); err != nil {
+		return fmt.Errorf("load users: %w", err)
+	}
+
+	if err := s.loadGrants(tx, config.Grants); err != nil {
+		return fmt.Errorf("load grants: %w", err)
+	}
+
+	return tx.Commit()
 }
 
-func (s Server) loadProviders(db data.GormTxn, providers []Provider) error {
+func (s Server) loadProviders(db data.WriteTxn, providers []Provider) error {
 	keep := []uid.ID{}
 
 	for _, p := range providers {
@@ -672,21 +670,29 @@ func (s Server) loadProviders(db data.GormTxn, providers []Provider) error {
 	}
 
 	// remove any provider previously defined by config
-	if err := data.DeleteProviders(db, data.NotIDs(keep), data.CreatedBy(models.CreatedBySystem)); err != nil {
+	if err := data.DeleteProviders(db, data.DeleteProvidersOptions{
+		CreatedBy: models.CreatedBySystem,
+		NotIDs:    keep,
+	}); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (Server) loadProvider(db data.GormTxn, input Provider) (*models.Provider, error) {
+func (s Server) loadProvider(db data.WriteTxn, input Provider) (*models.Provider, error) {
 	// provider kind is an optional field
 	kind, err := models.ParseProviderKind(input.Kind)
 	if err != nil {
 		return nil, fmt.Errorf("could not parse provider in config load: %w", err)
 	}
 
-	provider, err := data.GetProvider(db, data.ByName(input.Name))
+	clientSecret, err := secrets.GetSecret(input.ClientSecret, s.secrets)
+	if err != nil {
+		return nil, fmt.Errorf("could not load provider client secret: %w", err)
+	}
+
+	provider, err := data.GetProvider(db, data.GetProviderOptions{ByName: input.Name})
 	if err != nil {
 		if !errors.Is(err, internal.ErrNotFound) {
 			return nil, err
@@ -696,7 +702,7 @@ func (Server) loadProvider(db data.GormTxn, input Provider) (*models.Provider, e
 			Name:         input.Name,
 			URL:          input.URL,
 			ClientID:     input.ClientID,
-			ClientSecret: models.EncryptedAtRest(input.ClientSecret),
+			ClientSecret: models.EncryptedAtRest(clientSecret),
 			AuthURL:      input.AuthURL,
 			Scopes:       input.Scopes,
 			Kind:         kind,
@@ -710,7 +716,7 @@ func (Server) loadProvider(db data.GormTxn, input Provider) (*models.Provider, e
 		if provider.Kind != models.ProviderKindInfra {
 			// only call the provider to resolve info if it is not known
 			if input.AuthURL == "" && len(input.Scopes) == 0 {
-				providerClient := providers.NewOIDCClient(*provider, input.ClientSecret, "http://localhost:8301")
+				providerClient := providers.NewOIDCClient(*provider, clientSecret, "")
 				authServerInfo, err := providerClient.AuthServerInfo(context.Background())
 				if err != nil {
 					if errors.Is(err, context.DeadlineExceeded) {
@@ -743,17 +749,17 @@ func (Server) loadProvider(db data.GormTxn, input Provider) (*models.Provider, e
 	// provider already exists, update it
 	provider.URL = input.URL
 	provider.ClientID = input.ClientID
-	provider.ClientSecret = models.EncryptedAtRest(input.ClientSecret)
+	provider.ClientSecret = models.EncryptedAtRest(clientSecret)
 	provider.Kind = kind
 
-	if err := data.SaveProvider(db, provider); err != nil {
+	if err := data.UpdateProvider(db, provider); err != nil {
 		return nil, err
 	}
 
 	return provider, nil
 }
 
-func (s Server) loadGrants(db data.GormTxn, grants []Grant) error {
+func (s Server) loadGrants(db data.WriteTxn, grants []Grant) error {
 	keep := make([]uid.ID, 0, len(grants))
 
 	for _, g := range grants {
@@ -766,19 +772,22 @@ func (s Server) loadGrants(db data.GormTxn, grants []Grant) error {
 	}
 
 	// remove any grant previously defined by config
-	if err := data.DeleteGrants(db, data.NotIDs(keep), data.CreatedBy(models.CreatedBySystem)); err != nil {
+	if err := data.DeleteGrants(db, data.DeleteGrantsOptions{
+		NotIDs:      keep,
+		ByCreatedBy: models.CreatedBySystem,
+	}); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (Server) loadGrant(db data.GormTxn, input Grant) (*models.Grant, error) {
+func (Server) loadGrant(db data.WriteTxn, input Grant) (*models.Grant, error) {
 	var id uid.PolymorphicID
 
 	switch {
 	case input.User != "":
-		user, err := data.GetIdentity(db, data.ByName(input.User))
+		user, err := data.GetIdentity(db, data.GetIdentityOptions{ByName: input.User})
 		if err != nil {
 			return nil, err
 		}
@@ -786,7 +795,7 @@ func (Server) loadGrant(db data.GormTxn, input Grant) (*models.Grant, error) {
 		id = uid.NewIdentityPolymorphicID(user.ID)
 
 	case input.Group != "":
-		group, err := data.GetGroup(db, data.ByName(input.Group))
+		group, err := data.GetGroup(db, data.GetGroupOptions{ByName: input.Group})
 		if err != nil {
 			if !errors.Is(err, internal.ErrNotFound) {
 				return nil, err
@@ -807,15 +816,6 @@ func (Server) loadGrant(db data.GormTxn, input Grant) (*models.Grant, error) {
 
 		id = uid.NewGroupPolymorphicID(group.ID)
 
-	// TODO: remove this when deprecated machines in config are removed
-	case input.Machine != "":
-		machine, err := data.GetIdentity(db, data.ByName(input.Machine))
-		if err != nil {
-			return nil, err
-		}
-
-		id = uid.NewIdentityPolymorphicID(machine.ID)
-
 	default:
 		return nil, errors.New("invalid grant: missing identity")
 	}
@@ -824,7 +824,11 @@ func (Server) loadGrant(db data.GormTxn, input Grant) (*models.Grant, error) {
 		input.Role = models.BasePermissionConnect
 	}
 
-	grant, err := data.GetGrant(db, data.BySubject(id), data.ByResource(input.Resource), data.ByPrivilege(input.Role))
+	grant, err := data.GetGrant(db, data.GetGrantOptions{
+		BySubject:   id,
+		ByResource:  input.Resource,
+		ByPrivilege: input.Role,
+	})
 	if err != nil {
 		if !errors.Is(err, internal.ErrNotFound) {
 			return nil, err
@@ -845,7 +849,7 @@ func (Server) loadGrant(db data.GormTxn, input Grant) (*models.Grant, error) {
 	return grant, nil
 }
 
-func (s Server) loadUsers(db data.GormTxn, users []User) error {
+func (s Server) loadUsers(db data.WriteTxn, users []User) error {
 	keep := make([]uid.ID, 0, len(users)+1)
 
 	for _, i := range users {
@@ -858,15 +862,20 @@ func (s Server) loadUsers(db data.GormTxn, users []User) error {
 	}
 
 	// remove any users previously defined by config
-	if err := data.DeleteIdentities(db, data.NotIDs(keep), data.CreatedBy(models.CreatedBySystem)); err != nil {
+	opts := data.DeleteIdentitiesOptions{
+		ByProviderID: data.InfraProvider(db).ID,
+		ByNotIDs:     keep,
+		CreatedBy:    models.CreatedBySystem,
+	}
+	if err := data.DeleteIdentities(db, opts); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (s Server) loadUser(db data.GormTxn, input User) (*models.Identity, error) {
-	identity, err := data.GetIdentity(db, data.ByName(input.Name))
+func (s Server) loadUser(db data.WriteTxn, input User) (*models.Identity, error) {
+	identity, err := data.GetIdentity(db, data.GetIdentityOptions{ByName: input.Name})
 	if err != nil {
 		if !errors.Is(err, internal.ErrNotFound) {
 			return nil, err
@@ -887,6 +896,12 @@ func (s Server) loadUser(db data.GormTxn, input User) (*models.Identity, error) 
 		if err := data.CreateIdentity(db, identity); err != nil {
 			return nil, err
 		}
+
+		_, err = data.CreateProviderUser(db, data.InfraProvider(db), identity)
+		if err != nil {
+			return nil, err
+		}
+
 	}
 
 	if err := s.loadCredential(db, identity, input.Password); err != nil {
@@ -900,7 +915,7 @@ func (s Server) loadUser(db data.GormTxn, input User) (*models.Identity, error) 
 	return identity, nil
 }
 
-func (s Server) loadCredential(db data.GormTxn, identity *models.Identity, password string) error {
+func (s Server) loadCredential(db data.WriteTxn, identity *models.Identity, password string) error {
 	if password == "" {
 		return nil
 	}
@@ -915,7 +930,7 @@ func (s Server) loadCredential(db data.GormTxn, identity *models.Identity, passw
 		return err
 	}
 
-	credential, err := data.GetCredential(db, data.ByIdentityID(identity.ID))
+	credential, err := data.GetCredentialByUserID(db, identity.ID)
 	if err != nil {
 		if !errors.Is(err, internal.ErrNotFound) {
 			return err
@@ -939,14 +954,14 @@ func (s Server) loadCredential(db data.GormTxn, identity *models.Identity, passw
 
 	credential.PasswordHash = hash
 
-	if err := data.SaveCredential(db, credential); err != nil {
+	if err := data.UpdateCredential(db, credential); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (s Server) loadAccessKey(db data.GormTxn, identity *models.Identity, key string) error {
+func (s Server) loadAccessKey(db data.WriteTxn, identity *models.Identity, key string) error {
 	if key == "" {
 		return nil
 	}
@@ -961,25 +976,28 @@ func (s Server) loadAccessKey(db data.GormTxn, identity *models.Identity, key st
 		return fmt.Errorf("invalid access key format")
 	}
 
-	accessKey, err := data.GetAccessKey(db, data.ByKeyID(keyID))
+	accessKey, err := data.GetAccessKeyByKeyID(db, keyID)
 	if err != nil {
 		if !errors.Is(err, internal.ErrNotFound) {
 			return err
 		}
+
+		provider := data.InfraProvider(db)
 
 		accessKey := &models.AccessKey{
 			IssuedFor:  identity.ID,
 			ExpiresAt:  time.Now().AddDate(10, 0, 0),
 			KeyID:      keyID,
 			Secret:     secret,
-			ProviderID: data.InfraProvider(db).ID,
+			ProviderID: provider.ID,
+			Scopes:     models.CommaSeparatedStrings{models.ScopeAllowCreateAccessKey}, // allows user to create access keys
 		}
 
 		if _, err := data.CreateAccessKey(db, accessKey); err != nil {
 			return err
 		}
 
-		if _, err := data.CreateProviderUser(db, data.InfraProvider(db), identity); err != nil {
+		if _, err := data.CreateProviderUser(db, provider, identity); err != nil {
 			return err
 		}
 
@@ -992,7 +1010,7 @@ func (s Server) loadAccessKey(db data.GormTxn, identity *models.Identity, key st
 
 	accessKey.Secret = secret
 
-	if err := data.SaveAccessKey(db, accessKey); err != nil {
+	if err := data.UpdateAccessKey(db, accessKey); err != nil {
 		return err
 	}
 

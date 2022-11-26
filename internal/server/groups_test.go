@@ -12,26 +12,11 @@ import (
 	"gotest.tools/v3/assert"
 
 	"github.com/infrahq/infra/api"
+	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/server/data"
 	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/uid"
 )
-
-func createIdentities(t *testing.T, db data.GormTxn, identities ...*models.Identity) {
-	t.Helper()
-	for i := range identities {
-		err := data.CreateIdentity(db, identities[i])
-		assert.NilError(t, err, identities[i].Name)
-	}
-}
-
-func createGroups(t *testing.T, db data.GormTxn, groups ...*models.Group) {
-	t.Helper()
-	for i := range groups {
-		err := data.CreateGroup(db, groups[i])
-		assert.NilError(t, err, groups[i].Name)
-	}
-}
 
 func TestAPI_ListGroups(t *testing.T) {
 	srv := setupServer(t, withAdminUser)
@@ -74,8 +59,7 @@ func TestAPI_ListGroups(t *testing.T) {
 	}
 
 	run := func(t *testing.T, tc testCase) {
-		req, err := http.NewRequest(http.MethodGet, tc.urlPath, nil)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodGet, tc.urlPath, nil)
 		req.Header.Set("Authorization", "Bearer "+accessKey)
 		req.Header.Add("Infra-Version", "0.13.0")
 
@@ -214,8 +198,7 @@ func TestAPI_CreateGroup(t *testing.T) {
 	run := func(t *testing.T, tc testCase) {
 		body := jsonBody(t, tc.body)
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodPost, "/api/groups", body)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodPost, "/api/groups", body)
 		req.Header.Set("Authorization", "Bearer "+accessKey)
 		req.Header.Add("Infra-Version", "0.13.0")
 
@@ -276,15 +259,13 @@ func TestAPI_DeleteGroup(t *testing.T) {
 	srv := setupServer(t, withAdminUser)
 	routes := srv.GenerateRoutes()
 
-	var humans = models.Group{Name: "humans"}
+	humans := models.Group{Name: "humans"}
 	createGroups(t, srv.DB(), &humans)
 
-	var (
-		inGroup = models.Identity{
-			Name:   "inagroup@example.com",
-			Groups: []models.Group{humans},
-		}
-	)
+	inGroup := models.Identity{
+		Name:   "inagroup@example.com",
+		Groups: []models.Group{humans},
+	}
 
 	createIdentities(t, srv.DB(), &inGroup)
 
@@ -305,8 +286,7 @@ func TestAPI_DeleteGroup(t *testing.T) {
 
 	run := func(t *testing.T, tc testCase) {
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodDelete, tc.urlPath, nil)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodDelete, tc.urlPath, nil)
 		req.Header.Set("Authorization", "Bearer "+accessKey)
 		req.Header.Add("Infra-Version", "0.13.0")
 
@@ -337,9 +317,8 @@ func TestAPI_DeleteGroup(t *testing.T) {
 			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
 				assert.Equal(t, resp.Code, http.StatusNoContent, resp.Body.String())
-				actual, err := data.ListGroups(srv.DB(), nil, data.ByID(humans.ID))
-				assert.NilError(t, err)
-				assert.Equal(t, len(actual), 0)
+				_, err := data.GetGroup(srv.DB(), data.GetGroupOptions{ByID: humans.ID})
+				assert.ErrorIs(t, err, internal.ErrNotFound)
 			},
 		},
 	}
@@ -354,7 +333,7 @@ func TestAPI_UpdateUsersInGroup(t *testing.T) {
 	srv := setupServer(t, withAdminUser)
 	routes := srv.GenerateRoutes()
 
-	var humans = models.Group{Name: "humans"}
+	humans := models.Group{Name: "humans"}
 	createGroups(t, srv.DB(), &humans)
 
 	var (
@@ -383,8 +362,7 @@ func TestAPI_UpdateUsersInGroup(t *testing.T) {
 	run := func(t *testing.T, tc testCase) {
 		body := jsonBody(t, tc.body)
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodPatch, tc.urlPath, body)
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodPatch, tc.urlPath, body)
 		req.Header.Set("Authorization", "Bearer "+accessKey)
 		req.Header.Add("Infra-Version", "0.13.0")
 
@@ -415,7 +393,7 @@ func TestAPI_UpdateUsersInGroup(t *testing.T) {
 			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
 				assert.Equal(t, resp.Code, http.StatusOK, resp.Body.String())
-				idents, err := data.ListIdentities(srv.DB(), nil, []data.SelectorFunc{data.ByOptionalIdentityGroupID(humans.ID)}...)
+				idents, err := data.ListIdentities(srv.DB(), data.ListIdentityOptions{ByGroupID: humans.ID})
 				assert.NilError(t, err)
 				assert.DeepEqual(t, idents, []models.Identity{first, second}, cmpModelsIdentityShallow)
 			},
@@ -432,7 +410,7 @@ func TestAPI_UpdateUsersInGroup(t *testing.T) {
 			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
 				assert.Equal(t, resp.Code, http.StatusOK, resp.Body.String())
-				idents, err := data.ListIdentities(srv.DB(), nil, []data.SelectorFunc{data.ByOptionalIdentityGroupID(humans.ID)}...)
+				idents, err := data.ListIdentities(srv.DB(), data.ListIdentityOptions{ByGroupID: humans.ID})
 				assert.NilError(t, err)
 				assert.Assert(t, len(idents) == 0)
 			},

@@ -28,9 +28,7 @@ func TestServerLimitsAccessWithTemporaryPassword(t *testing.T) {
 	// user can't access other urls.
 	tryOtherURL := func() *httptest.ResponseRecorder {
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodGet, "/api/users/"+loginResp.UserID.String(), nil)
-		assert.NilError(t, err)
-
+		req := httptest.NewRequest(http.MethodGet, "/api/users/"+loginResp.UserID.String(), nil)
 		req.Header.Add("Authorization", "Bearer "+key)
 		req.Header.Add("Infra-Version", "0.14")
 
@@ -43,7 +41,7 @@ func TestServerLimitsAccessWithTemporaryPassword(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, resp1.Code)
 
 	// change password
-	changePassword(t, routes, key, loginResp.UserID, "balloons")
+	changePassword(t, routes, key, loginResp.UserID, resp.OneTimePassword, "balloons")
 
 	// can access other urls.
 	resp2 := tryOtherURL()
@@ -51,43 +49,16 @@ func TestServerLimitsAccessWithTemporaryPassword(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp2.Code)
 }
 
-func createUser(t *testing.T, srv *Server, routes Routes, email string) *api.CreateUserResponse {
-	r := &api.CreateUserRequest{
-		Name: email,
-	}
-	body, err := json.Marshal(r)
-	assert.NilError(t, err)
-
-	// nolint:noctx
-	req, err := http.NewRequest(http.MethodPost, "/api/users", bytes.NewReader(body))
-	assert.NilError(t, err)
-
-	req.Header.Add("Authorization", "Bearer "+adminAccessKey(srv))
-	req.Header.Add("Infra-Version", "0.14")
-
-	resp := httptest.NewRecorder()
-	routes.ServeHTTP(resp, req)
-
-	assert.Equal(t, 201, resp.Code)
-
-	result := &api.CreateUserResponse{}
-	err = json.Unmarshal(resp.Body.Bytes(), result)
-	assert.NilError(t, err)
-
-	return result
-}
-
-func changePassword(t *testing.T, routes Routes, accessKey string, id uid.ID, password string) *api.User {
+func changePassword(t *testing.T, routes Routes, accessKey string, id uid.ID, oldPassword, password string) *api.User {
 	r := &api.UpdateUserRequest{
-		Password: password,
+		OldPassword: oldPassword,
+		Password:    password,
 	}
 	body, err := json.Marshal(r)
 	assert.NilError(t, err)
 
 	// nolint:noctx
-	req, err := http.NewRequest(http.MethodPut, "/api/users/"+id.String(), bytes.NewReader(body))
-	assert.NilError(t, err)
-
+	req := httptest.NewRequest(http.MethodPut, "/api/users/"+id.String(), bytes.NewReader(body))
 	req.Header.Add("Authorization", "Bearer "+accessKey)
 	req.Header.Add("Infra-Version", "0.14")
 

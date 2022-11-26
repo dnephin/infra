@@ -1,22 +1,19 @@
 package data
 
 import (
+	"context"
 	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"fmt"
-	"net/url"
-	"os"
-	"path"
-	"reflect"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgerrcode"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
+	"github.com/rs/zerolog"
 
 	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/logging"
@@ -25,31 +22,51 @@ import (
 	"github.com/infrahq/infra/uid"
 )
 
+type NewDBOptions struct {
+	DSN string
+
+	EncryptionKeyProvider EncryptionKeyProvider
+	RootKeyID             string
+
+	MaxOpenConnections int
+	MaxIdleConnections int
+	MaxIdleTimeout     time.Duration
+}
+
 // NewDB creates a new database connection and runs any required database migrations
 // before returning the connection. The loadDBKey function is called after
 // initializing the schema, but before any migrations.
-func NewDB(connection gorm.Dialector, loadDBKey func(db GormTxn) error) (*DB, error) {
-	db, err := newRawDB(connection)
+func NewDB(dbOpts NewDBOptions) (*DB, error) {
+	db, err := newRawDB(dbOpts)
 	if err != nil {
 		return nil, fmt.Errorf("db conn: %w", err)
 	}
 	dataDB := &DB{DB: db}
+	tx, err := dataDB.Begin(context.TODO(), nil)
+	if err != nil {
+		return nil, err
+	}
 
 	opts := migrator.Options{
 		InitSchema: initializeSchema,
 		LoadKey: func(tx migrator.DB) error {
-			if loadDBKey == nil {
+			if dbOpts.EncryptionKeyProvider == nil {
 				return nil
 			}
-			// TODO: use the passed in tx instead of dataDB once the queries
-			// used by loadDBKey are ported to sql
-			return loadDBKey(dataDB)
+			return loadDBKey(tx, dbOpts.EncryptionKeyProvider, dbOpts.RootKeyID)
 		},
 	}
-	m := migrator.New(dataDB, opts, migrations())
+	m := migrator.New(tx, opts, migrations())
 	if err := m.Migrate(); err != nil {
+		if err := tx.Rollback(); err != nil {
+			logging.L.Warn().Err(err).Msg("failed to rollback")
+		}
 		return nil, fmt.Errorf("migration failed: %w", err)
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit migrations: %w", err)
+	}
+
 	if err := initialize(dataDB); err != nil {
 		return nil, fmt.Errorf("initialize database: %w", err)
 	}
@@ -60,7 +77,7 @@ func NewDB(connection gorm.Dialector, loadDBKey func(db GormTxn) error) (*DB, er
 // DB wraps the underlying database and provides access to the default org,
 // and settings.
 type DB struct {
-	*gorm.DB // embedded for now to minimize the diff
+	DB *sql.DB
 
 	DefaultOrg *models.Organization
 	// DefaultOrgSettings are the settings for DefaultOrg
@@ -68,28 +85,63 @@ type DB struct {
 }
 
 func (d *DB) Close() error {
-	sqlDB, err := d.DB.DB()
-	if err != nil {
-		return fmt.Errorf("failed to get database conn to close: %w", err)
-	}
-	return sqlDB.Close()
+	return d.DB.Close()
 }
 
-func (d *DB) DriverName() string {
-	return d.Dialector.Name()
+func (d *DB) SQLdb() *sql.DB {
+	return d.DB
 }
 
 func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
-	db := d.DB.Exec(query, args...)
-	return driver.RowsAffected(db.RowsAffected), db.Error
+	var affected int64
+	start := time.Now()
+	query = rewriteQueryPlaceholders(query, len(args))
+	result, err := d.DB.Exec(query, args...)
+	if err == nil {
+		affected, err = result.RowsAffected()
+	}
+	logQuery(query, err, start, affected)
+	return result, err
 }
 
 func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
-	return d.DB.Raw(query, args...).Rows()
+	start := time.Now()
+	query = rewriteQueryPlaceholders(query, len(args))
+	rows, err := d.DB.Query(query, args...)
+	logQuery(query, err, start, -1)
+	return rows, err
+
 }
 
 func (d *DB) QueryRow(query string, args ...any) *sql.Row {
-	return d.DB.Raw(query, args...).Row()
+	start := time.Now()
+	query = rewriteQueryPlaceholders(query, len(args))
+	row := d.DB.QueryRow(query, args...)
+	logQuery(query, row.Err(), start, -1)
+	return row
+}
+
+func rewriteQueryPlaceholders(query string, num int) string {
+	var counter int
+	var buf strings.Builder
+	buf.Grow(len(query))
+
+	for _, r := range query {
+		if r != '?' {
+			buf.WriteRune(r)
+			continue
+		}
+
+		counter++
+		buf.WriteString("$" + strconv.Itoa(counter))
+	}
+
+	// if counter == 0 it could indicate the query was constructed with the
+	// correct placeholders and doesn't need rewrite.
+	if counter != 0 && counter != num {
+		panic(fmt.Sprintf("wrong number of placeholders (%d) for args (%d)", counter, num))
+	}
+	return buf.String()
 }
 
 func (d *DB) OrganizationID() uid.ID {
@@ -98,40 +150,28 @@ func (d *DB) OrganizationID() uid.ID {
 	return d.DefaultOrg.ID
 }
 
-func (d *DB) GormDB() *gorm.DB {
-	return d.DB
+// Begin starts a new transaction. The ctx will cancel any queries performed by
+// the returned Transaction.
+func (d *DB) Begin(ctx context.Context, opts *sql.TxOptions) (*Transaction, error) {
+	tx, err := d.DB.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Transaction{
+		Tx:        tx,
+		txCtx:     ctx,
+		completed: new(atomic.Bool),
+	}, nil
 }
 
-type WriteTxn interface {
-	ReadTxn
-	Exec(sql string, values ...interface{}) (sql.Result, error)
-}
-
-type ReadTxn interface {
-	DriverName() string
-	Query(query string, args ...any) (*sql.Rows, error)
-	QueryRow(query string, args ...any) *sql.Row
-
-	OrganizationID() uid.ID
-}
-
-// GormTxn is used as a shim in preparation for removing gorm.
-type GormTxn interface {
-	WriteTxn
-
-	// GormDB returns the underlying reference to the gorm.DB struct.
-	// Do not use this in new code! Instead, write SQL using the stdlib\
-	// interface of Query, QueryRow, and Exec.
-	GormDB() *gorm.DB
-}
-
+// Transaction is a database transaction with metadata about the request that
+// was given this transaction. Use DB.Begin to create a transaction.
 type Transaction struct {
-	*gorm.DB
-	orgID uid.ID
-}
+	Tx    *sql.Tx
+	txCtx context.Context
 
-func (t Transaction) DriverName() string {
-	return t.Dialector.Name()
+	orgID     uid.ID
+	completed *atomic.Bool
 }
 
 func (t *Transaction) OrganizationID() uid.ID {
@@ -139,50 +179,77 @@ func (t *Transaction) OrganizationID() uid.ID {
 }
 
 func (t *Transaction) Exec(query string, args ...any) (sql.Result, error) {
-	db := t.DB.Exec(query, args...)
-	return driver.RowsAffected(db.RowsAffected), db.Error
+	var affected int64
+	start := time.Now()
+	query = rewriteQueryPlaceholders(query, len(args))
+	result, err := t.Tx.ExecContext(t.txCtx, query, args...)
+	if err == nil {
+		affected, err = result.RowsAffected()
+	}
+	logQuery(query, err, start, affected)
+	return result, err
 }
 
 func (t *Transaction) Query(query string, args ...any) (*sql.Rows, error) {
-	return t.DB.Raw(query, args...).Rows()
+	start := time.Now()
+	query = rewriteQueryPlaceholders(query, len(args))
+	rows, err := t.Tx.QueryContext(t.txCtx, query, args...)
+	logQuery(query, err, start, -1)
+	return rows, err
 }
 
 func (t *Transaction) QueryRow(query string, args ...any) *sql.Row {
-	return t.DB.Raw(query, args...).Row()
+	start := time.Now()
+	query = rewriteQueryPlaceholders(query, len(args))
+	row := t.Tx.QueryRowContext(t.txCtx, query, args...)
+	logQuery(query, row.Err(), start, -1)
+	return row
 }
 
-func (t *Transaction) GormDB() *gorm.DB {
-	return t.DB
+// Rollback the transaction. If the transaction was already committed then do
+// nothing.
+func (t *Transaction) Rollback() error {
+	if t.completed.Load() {
+		return nil
+	}
+	err := t.Tx.Rollback()
+	if err == nil {
+		t.completed.Store(true)
+	}
+	return err
 }
 
-func NewTransaction(db *gorm.DB, orgID uid.ID) *Transaction {
-	return &Transaction{DB: db, orgID: orgID}
+func (t *Transaction) Commit() error {
+	err := t.Tx.Commit()
+	if err == nil {
+		t.completed.Store(true)
+	}
+	return err
+}
+
+// WithOrgID returns a shallow copy of the Transaction with the OrganizationID
+// set to orgID. Note that the underlying database transaction and commit state
+// is shared with the new copy.
+func (t *Transaction) WithOrgID(orgID uid.ID) *Transaction {
+	newTxn := *t
+	newTxn.orgID = orgID
+	return &newTxn
 }
 
 // newRawDB creates a new database connection without running migrations.
-func newRawDB(connection gorm.Dialector) (*gorm.DB, error) {
-	db, err := gorm.Open(connection, &gorm.Config{
-		Logger: logging.NewDatabaseLogger(time.Second),
-	})
+func newRawDB(options NewDBOptions) (*sql.DB, error) {
+	if options.DSN == "" {
+		return nil, fmt.Errorf("missing postgres dsn")
+	}
+
+	db, err := sql.Open("pgx", options.DSN)
 	if err != nil {
 		return nil, err
 	}
 
-	sqlDB, err := db.DB()
-	if err != nil {
-		return nil, fmt.Errorf("getting db driver: %w", err)
-	}
-
-	if connection.Name() == "sqlite" {
-		// avoid issues with concurrent writes by telling gorm
-		// not to open multiple connections in the connection pool
-		sqlDB.SetMaxOpenConns(1)
-	} else {
-		// TODO: make these configurable from server config
-		sqlDB.SetMaxIdleConns(900)
-		sqlDB.SetMaxOpenConns(1000)
-		sqlDB.SetConnMaxIdleTime(5 * time.Minute)
-	}
+	db.SetMaxOpenConns(options.MaxOpenConnections)
+	db.SetMaxIdleConns(options.MaxIdleConnections)
+	db.SetConnMaxIdleTime(options.MaxIdleTimeout)
 
 	return db, nil
 }
@@ -190,15 +257,22 @@ func newRawDB(connection gorm.Dialector) (*gorm.DB, error) {
 const defaultOrganizationID = 1000
 
 func initialize(db *DB) error {
-	org, err := GetOrganization(db, ByID(defaultOrganizationID))
+	tx, err := db.Begin(context.TODO(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	org, err := GetOrganization(tx, GetOrganizationOptions{ByID: defaultOrganizationID})
 	switch {
 	case errors.Is(err, internal.ErrNotFound):
 		org = &models.Organization{
-			Model:     models.Model{ID: defaultOrganizationID},
-			Name:      "Default",
-			CreatedBy: models.CreatedBySystem,
+			Model:          models.Model{ID: defaultOrganizationID},
+			Name:           "Default",
+			CreatedBy:      models.CreatedBySystem,
+			AllowedDomains: []string{},
 		}
-		if err := CreateOrganization(db, org); err != nil {
+		if err := CreateOrganization(tx, org); err != nil {
 			return fmt.Errorf("failed to create default organization: %w", err)
 		}
 	case err != nil:
@@ -206,65 +280,11 @@ func initialize(db *DB) error {
 	}
 
 	db.DefaultOrg = org
-	db.DefaultOrgSettings, err = getSettingsForOrg(db, org.ID)
+	db.DefaultOrgSettings, err = getSettingsForOrg(tx, org.ID)
 	if err != nil {
 		return fmt.Errorf("getting settings: %w", err)
 	}
-	return nil
-}
-
-func NewSQLiteDriver(connection string) (gorm.Dialector, error) {
-	if !strings.HasPrefix(connection, "file::memory") {
-		if err := os.MkdirAll(path.Dir(connection), os.ModePerm); err != nil {
-			return nil, err
-		}
-	}
-	uri, err := url.Parse(connection)
-	if err != nil {
-		return nil, err
-	}
-	query := uri.Query()
-	query.Add("_journal_mode", "WAL")
-	uri.RawQuery = query.Encode()
-	connection = uri.String()
-
-	return sqlite.Open(connection), nil
-}
-
-func getDefaultSortFromType(t interface{}) string {
-	ty := reflect.TypeOf(t).Elem()
-	if _, ok := ty.FieldByName("Name"); ok {
-		return "name ASC"
-	}
-
-	if _, ok := ty.FieldByName("Email"); ok {
-		// foreign key relations, such as provider users in this case, may not have the default ID
-		return "email ASC"
-	}
-
-	return "id ASC"
-}
-
-func get[T models.Modelable](tx GormTxn, selectors ...SelectorFunc) (*T, error) {
-	db := tx.GormDB()
-	for _, selector := range selectors {
-		db = selector(db)
-	}
-
-	result := new(T)
-	if isOrgMember(result) {
-		db = ByOrgID(tx.OrganizationID())(db)
-	}
-
-	if err := db.Model((*T)(nil)).First(result).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, internal.ErrNotFound
-		}
-
-		return nil, err
-	}
-
-	return result, nil
+	return tx.Commit()
 }
 
 // setOrg checks if model is an organization member, and sets the organizationID
@@ -286,60 +306,6 @@ type orgMember interface {
 func isOrgMember(model any) bool {
 	_, ok := model.(orgMember)
 	return ok
-}
-
-func list[T models.Modelable](tx GormTxn, p *Pagination, selectors ...SelectorFunc) ([]T, error) {
-	db := tx.GormDB()
-	db = db.Order(getDefaultSortFromType((*T)(nil)))
-	for _, selector := range selectors {
-		db = selector(db)
-	}
-	if isOrgMember(new(T)) {
-		db = ByOrgID(tx.OrganizationID())(db)
-	}
-
-	if p != nil {
-		var count int64
-		if err := db.Model((*T)(nil)).Count(&count).Error; err != nil {
-			return nil, err
-		}
-		p.SetTotalCount(int(count))
-
-		db = ByPagination(*p)(db)
-	}
-
-	result := make([]T, 0)
-	if err := db.Model((*T)(nil)).Find(&result).Error; err != nil {
-		return nil, err
-	}
-
-	return result, nil
-}
-
-func save[T models.Modelable](tx GormTxn, model *T) error {
-	db := tx.GormDB()
-	setOrg(tx, model)
-	err := db.Save(model).Error
-	return handleError(err)
-}
-
-func add[T models.Modelable](tx GormTxn, model *T) error {
-	db := tx.GormDB()
-	setOrg(tx, model)
-
-	var err error
-	if tx.DriverName() == "postgres" {
-		// failures on postgres need to be rolled back in order to
-		// continue using the same transaction
-		db.SavePoint("beforeCreate")
-		err = db.Create(model).Error
-		if err != nil {
-			db.RollbackTo("beforeCreate")
-		}
-	} else {
-		err = db.Create(model).Error
-	}
-	return handleError(err)
 }
 
 type UniqueConstraintError struct {
@@ -385,6 +351,11 @@ func handleError(err error) error {
 		return nil
 	}
 
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return internal.ErrNotFound
+	}
+
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
@@ -393,12 +364,13 @@ func handleError(err error) error {
 			// user facing name of that field.
 			constraintFields := map[string]string{
 				"idx_identities_name":         "name",
+				"idx_identities_verified":     "verificationToken",
 				"idx_groups_name":             "name",
 				"idx_providers_name":          "name",
 				"idx_access_keys_name":        "name",
-				"idx_destinations_unique_id":  "uniqueId",
+				"idx_destinations_unique_id":  "uniqueID",
 				"idx_access_keys_key_id":      "keyId",
-				"idx_credentials_identity_id": "identityId",
+				"idx_credentials_identity_id": "identityID",
 				"idx_organizations_domain":    "domain",
 			}
 
@@ -439,59 +411,53 @@ func handleError(err error) error {
 	return err
 }
 
-func delete[T models.Modelable](tx GormTxn, id uid.ID) error {
-	db := tx.GormDB()
-	if isOrgMember(new(T)) {
-		db = ByOrgID(tx.OrganizationID())(db)
-	}
-	return db.Delete(new(T), id).Error
-}
-
-func deleteAll[T models.Modelable](tx GormTxn, selectors ...SelectorFunc) error {
-	db := tx.GormDB()
-	for _, selector := range selectors {
-		db = selector(db)
-	}
-	if isOrgMember(new(T)) {
-		db = ByOrgID(tx.OrganizationID())(db)
-	}
-
-	return db.Delete(new(T)).Error
-}
-
-// GlobalCount gives the count of all records, not scoped by org.
-func GlobalCount[T models.Modelable](tx GormTxn, selectors ...SelectorFunc) (int64, error) {
-	db := tx.GormDB()
-	for _, selector := range selectors {
-		db = selector(db)
-	}
-
-	var count int64
-	if err := db.Model((*T)(nil)).Count(&count).Error; err != nil {
-		return -1, err
-	}
-
-	return count, nil
-}
-
-// InfraProvider returns the infra provider for the organization set in the db
-// context.
-func InfraProvider(db GormTxn) *models.Provider {
-	infra, err := get[models.Provider](db, ByProviderKind(models.ProviderKindInfra), ByOrgID(db.OrganizationID()))
+// InfraProvider returns the infra provider for the organization set in the tx.
+func InfraProvider(tx ReadTxn) *models.Provider {
+	infra, err := GetProvider(tx, GetProviderOptions{KindInfra: true})
 	if err != nil {
 		logging.L.Panic().Err(err).Msg("failed to retrieve infra provider")
-		return nil // unreachable, the line above panics
 	}
 	return infra
 }
 
 // InfraConnectorIdentity returns the connector identity for the organization set
 // in the db context.
-func InfraConnectorIdentity(db GormTxn) *models.Identity {
-	connector, err := GetIdentity(db, ByName(models.InternalInfraConnectorIdentityName), ByOrgID(db.OrganizationID()))
+func InfraConnectorIdentity(db ReadTxn) *models.Identity {
+	connector, err := GetIdentity(db, GetIdentityOptions{ByName: models.InternalInfraConnectorIdentityName})
 	if err != nil {
 		logging.L.Panic().Err(err).Msg("failed to retrieve connector identity")
-		return nil // unreachable, the line above panics
 	}
 	return connector
+}
+
+const slowQueryThreshold = time.Second
+
+func logQuery(query string, err error, startedAt time.Time, rows int64) {
+	level := zerolog.TraceLevel
+
+	elapsed := time.Since(startedAt)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		level = zerolog.WarnLevel
+	case elapsed > slowQueryThreshold:
+		level = zerolog.WarnLevel
+	}
+
+	query = normalizeQueryString(query)
+	logging.L.WithLevel(level).
+		CallerSkipFrame(2). // logQuery + tx.{Query,Exec}
+		Int64("rows", rows).
+		Str("query", query).
+		Dur("elapsed", elapsed).
+		Msg("DB query")
+}
+
+var replaceQueryWhitespace = strings.NewReplacer("\t", " ", "\n", " ")
+
+// normalizeQueryString prepares a query string for being logged or printed.
+// normalizeQueryString removes leading and trailing whitespace, and converts any
+// tabs or newlines in the query string to spaces.
+func normalizeQueryString(query string) string {
+	query = strings.TrimSpace(query)
+	return replaceQueryWhitespace.Replace(query)
 }

@@ -2,6 +2,7 @@ package data
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"io/ioutil"
@@ -22,6 +23,7 @@ import (
 	"github.com/infrahq/infra/internal/server/data/migrator"
 	"github.com/infrahq/infra/internal/server/data/schema"
 	"github.com/infrahq/infra/internal/server/models"
+	"github.com/infrahq/infra/internal/testing/database"
 	"github.com/infrahq/infra/internal/testing/patch"
 	"github.com/infrahq/infra/uid"
 )
@@ -35,9 +37,9 @@ func TestMigrations(t *testing.T) {
 
 	type testCase struct {
 		label    testCaseLabel
-		setup    func(t *testing.T, db WriteTxn)
-		expected func(t *testing.T, db WriteTxn)
-		cleanup  func(t *testing.T, db WriteTxn)
+		setup    func(t *testing.T, tx WriteTxn)
+		expected func(t *testing.T, tx WriteTxn)
+		cleanup  func(t *testing.T, tx WriteTxn)
 	}
 
 	run := func(t *testing.T, index int, tc testCase, db *DB) {
@@ -46,14 +48,15 @@ func TestMigrations(t *testing.T) {
 			t.Fatalf("there are more test cases than migrations")
 		}
 		mgs := allMigrations[:index+1]
+		currentMigration := mgs[len(mgs)-1]
 
-		if mID := mgs[len(mgs)-1].ID; mID != tc.label.Name {
+		if mID := currentMigration.ID; mID != tc.label.Name {
 			t.Error("the list of test cases is not in the same order as the list of migrations")
 			t.Fatalf("test case %v was run with migration ID %v", tc.label.Name, mID)
 		}
 
 		if index == 0 {
-			filename := fmt.Sprintf("testdata/migrations/%v-%v.sql", tc.label.Name, db.Dialector.Name())
+			filename := fmt.Sprintf("testdata/migrations/%v-postgres.sql", tc.label.Name)
 			raw, err := ioutil.ReadFile(filename)
 			assert.NilError(t, err)
 
@@ -74,11 +77,29 @@ func TestMigrations(t *testing.T) {
 			},
 		}
 
-		m := migrator.New(db, opts, mgs)
-		err := m.Migrate()
+		tx, err := db.Begin(context.Background(), nil)
 		assert.NilError(t, err)
+		defer tx.Rollback()
 
-		tc.expected(t, db)
+		m := migrator.New(tx, opts, mgs)
+		err = m.Migrate()
+		assert.NilError(t, err)
+		assert.NilError(t, tx.Commit())
+
+		t.Run("run again to check idempotency", func(t *testing.T) {
+			tx, err := db.Begin(context.Background(), nil)
+			assert.NilError(t, err)
+			defer tx.Rollback()
+
+			err = currentMigration.Migrate(tx)
+			assert.NilError(t, err)
+			assert.NilError(t, tx.Commit())
+		})
+
+		tx, err = db.Begin(context.Background(), nil)
+		assert.NilError(t, err)
+		defer tx.Rollback()
+		tc.expected(t, tx)
 	}
 
 	testCases := []testCase{
@@ -119,16 +140,13 @@ func TestMigrations(t *testing.T) {
 				}
 
 				query := `SELECT name, kind FROM providers where deleted_at is null`
-				var actual []provider
 				rows, err := db.Query(query)
 				assert.NilError(t, err)
 
-				for rows.Next() {
-					var p provider
-					err := rows.Scan(&p.Name, &p.Kind)
-					assert.NilError(t, err)
-					actual = append(actual, p)
-				}
+				actual, err := scanRows(rows, func(p *provider) []any {
+					return []any{&p.Name, &p.Kind}
+				})
+				assert.NilError(t, err)
 
 				expected := []provider{
 					{Name: "infra", Kind: models.ProviderKindInfra},
@@ -152,6 +170,7 @@ func TestMigrations(t *testing.T) {
 		{
 			label: testCaseLine("202206281027"),
 			setup: func(t *testing.T, db WriteTxn) {
+				t.Skip("this migration no longer works with transactions")
 				stmt := `
 INSERT INTO providers (id, created_at, updated_at, deleted_at, name, url, client_id, client_secret, kind, created_by) VALUES (67301777540980736, '2022-07-05 17:13:14.172568+00', '2022-07-05 17:13:14.172568+00', NULL, 'infra', '', '', 'AAAAEIRG2/PYF2erJG6cYHTybucGYWVzZ2NtBDjJTEEbL3Jvb3QvLmluZnJhL3NxbGl0ZTMuZGIua2V5DGt4MdtlZuxOUhZQTw', 'infra', 1);
 INSERT INTO providers (id, created_at, updated_at, deleted_at, name, url, client_id, client_secret, kind, created_by) VALUES (67301777540980737, '2022-07-05 17:13:14.172568+00', '2022-07-05 17:13:14.172568+00', NULL, 'okta', 'example.okta.com', 'client-id', 'AAAAEIRG2/PYF2erJG6cYHTybucGYWVzZ2NtBDjJTEEbL3Jvb3QvLmluZnJhL3NxbGl0ZTMuZGIua2V5DGt4MdtlZuxOUhZQTw', 'okta', 1);
@@ -197,7 +216,7 @@ INSERT INTO providers (id, created_at, updated_at, deleted_at, name, url, client
 			setup: func(t *testing.T, db WriteTxn) {
 				stmt := `
 INSERT INTO destinations (id, created_at, updated_at, name, unique_id)
-VALUES (12345, '2022-07-05 00:41:49.143574', '2022-07-05 01:41:49.143574', 'the-destination', 'unique-id');`
+VALUES (12345, '2022-07-05 00:41:49.143574', '2022-07-05 01:41:49.143574Z', 'the-destination', 'unique-id');`
 				_, err := db.Exec(stmt)
 				assert.NilError(t, err)
 			},
@@ -419,16 +438,12 @@ INSERT INTO provider_users (identity_id, provider_id, id, created_at, updated_at
 			setup: func(t *testing.T, db WriteTxn) {
 				stmt := `
 INSERT INTO providers(id, name) VALUES (12345, 'okta');
-INSERT INTO settings(id) VALUES(24567);
 `
 				_, err := db.Exec(stmt)
 				assert.NilError(t, err)
 			},
 			cleanup: func(t *testing.T, db WriteTxn) {
-				stmt := `
-DELETE FROM providers WHERE id=12345;
-DELETE FROM settings WHERE id=24567;
-`
+				stmt := `DELETE FROM providers WHERE id=12345;`
 				_, err := db.Exec(stmt)
 				assert.NilError(t, err)
 			},
@@ -437,13 +452,10 @@ DELETE FROM settings WHERE id=24567;
 				rows, err := db.Query(stmt)
 				assert.NilError(t, err)
 
-				var orgs []models.Organization
-				for rows.Next() {
-					org := models.Organization{}
-					err := rows.Scan(&org.ID, &org.Name, &org.CreatedAt, &org.UpdatedAt)
-					assert.NilError(t, err)
-					orgs = append(orgs, org)
-				}
+				orgs, err := scanRows(rows, func(org *models.Organization) []any {
+					return []any{&org.ID, &org.Name, &org.CreatedAt, &org.UpdatedAt}
+				})
+				assert.NilError(t, err)
 
 				now := time.Now()
 				expected := []models.Organization{
@@ -476,7 +488,7 @@ DELETE FROM settings WHERE id=24567;
 				assert.NilError(t, err)
 
 				expectedSettings := &models.Settings{
-					Model:              models.Model{ID: 24567},
+					Model:              models.Model{ID: 555111},
 					OrganizationMember: models.OrganizationMember{OrganizationID: org.ID},
 				}
 				assert.DeepEqual(t, s, expectedSettings)
@@ -510,16 +522,9 @@ DELETE FROM settings WHERE id=24567;
 				stmt := ` INSERT INTO providers(id, name, organization_id) VALUES (12345, 'okta', ?)`
 				_, err = db.Exec(stmt, originalOrgID)
 				assert.NilError(t, err)
-
-				stmt = `INSERT INTO settings(id, organization_id) VALUES(24567, ?); `
-				_, err = db.Exec(stmt, originalOrgID)
-				assert.NilError(t, err)
 			},
 			cleanup: func(t *testing.T, db WriteTxn) {
-				stmt := `
-DELETE FROM providers WHERE id=12345;
-DELETE FROM settings WHERE id=24567;
-`
+				stmt := `DELETE FROM providers WHERE id=12345;`
 				_, err := db.Exec(stmt)
 				assert.NilError(t, err)
 			},
@@ -553,10 +558,322 @@ DELETE FROM settings WHERE id=24567;
 				assert.NilError(t, err)
 
 				expectedSettings := &models.Settings{
-					Model:              models.Model{ID: 24567},
+					Model:              models.Model{ID: 555111},
 					OrganizationMember: models.OrganizationMember{OrganizationID: org.ID},
 				}
 				assert.DeepEqual(t, s, expectedSettings)
+			},
+		},
+		{
+			label: testCaseLine("2022-09-01T15:00"),
+			setup: func(t *testing.T, db WriteTxn) {
+				var originalOrgID uid.ID
+				err := db.QueryRow(`SELECT id from organizations where name='Default'`).Scan(&originalOrgID)
+				assert.NilError(t, err)
+
+				stmt := ` INSERT INTO identities(id, name, organization_id) VALUES (12345, 'migration1@example.com', ?)`
+				_, err = db.Exec(stmt, originalOrgID)
+				assert.NilError(t, err)
+			},
+			expected: func(t *testing.T, db WriteTxn) {
+				stmt := `SELECT verification_token, verified FROM identities where id = ?`
+				user := &models.Identity{}
+				err := db.QueryRow(stmt, 12345).Scan(&user.VerificationToken, &user.Verified)
+				assert.NilError(t, err)
+
+				assert.Assert(t, !user.Verified)
+				assert.Assert(t, len(user.VerificationToken) == 10)
+			},
+			cleanup: func(t *testing.T, db WriteTxn) {
+				stmt := `DELETE FROM identities WHERE id=12345;`
+				_, err := db.Exec(stmt)
+				assert.NilError(t, err)
+			},
+		},
+		{
+			label: testCaseLine("2022-09-22T11:00"),
+			setup: func(t *testing.T, tx WriteTxn) {
+				orgA := uid.ID(1000)
+				orgB := uid.ID(2000)
+
+				groupA := models.Group{
+					Model: models.Model{
+						ID: 1001,
+					},
+					OrganizationMember: models.OrganizationMember{
+						OrganizationID: orgA,
+					},
+					Name: "group A",
+				}
+
+				groupB := models.Group{
+					Model: models.Model{
+						ID: 1002,
+					},
+					OrganizationMember: models.OrganizationMember{
+						OrganizationID: orgB,
+					},
+					Name: "group B",
+				}
+
+				identityA := models.Identity{
+					Model: models.Model{
+						ID: 1003,
+					},
+					OrganizationMember: models.OrganizationMember{
+						OrganizationID: orgA,
+					},
+					Name: "identity A",
+				}
+
+				identityB := models.Identity{
+					Model: models.Model{
+						ID: 1004,
+					},
+					OrganizationMember: models.OrganizationMember{
+						OrganizationID: orgB,
+					},
+					Name: "identity B",
+				}
+
+				stmt := `INSERT INTO groups(id, name, organization_id) VALUES (?, ?, ?)`
+				_, err := tx.Exec(stmt, groupA.ID, groupA.Name, groupA.OrganizationID)
+				assert.NilError(t, err)
+				_, err = tx.Exec(stmt, groupB.ID, groupB.Name, groupB.OrganizationID)
+				assert.NilError(t, err)
+
+				stmt = `INSERT INTO identities(id, name, organization_id) VALUES (?, ?, ?)`
+				_, err = tx.Exec(stmt, identityA.ID, identityA.Name, identityA.OrganizationID)
+				assert.NilError(t, err)
+				_, err = tx.Exec(stmt, identityB.ID, identityB.Name, identityB.OrganizationID)
+				assert.NilError(t, err)
+
+				stmt = `INSERT INTO identities_groups(identity_id, group_id) VALUES (?, ?)`
+				_, err = tx.Exec(stmt, identityA.ID, groupA.ID)
+				assert.NilError(t, err)
+				_, err = tx.Exec(stmt, identityB.ID, groupB.ID)
+				assert.NilError(t, err)
+				_, err = tx.Exec(stmt, identityB.ID, groupA.ID)
+				assert.NilError(t, err)
+			},
+			cleanup: func(t *testing.T, tx WriteTxn) {
+				stmt := `
+					DELETE FROM groups;
+					DELETE FROM identities;
+					DELETE from identities_groups;
+				`
+				_, err := tx.Exec(stmt)
+				assert.NilError(t, err)
+			},
+			expected: func(t *testing.T, tx WriteTxn) {
+				type identityGroup struct {
+					IdentityID uid.ID
+					GroupID    uid.ID
+				}
+				var results []identityGroup
+
+				stmt := `SELECT identity_id, group_id FROM identities_groups`
+				rows, err := tx.Query(stmt)
+				assert.NilError(t, err)
+				for rows.Next() {
+					var item identityGroup
+					err := rows.Scan(&item.IdentityID, &item.GroupID)
+					assert.NilError(t, err)
+
+					results = append(results, item)
+				}
+				assert.NilError(t, rows.Close())
+
+				for _, item := range results {
+					var identityOrgID uid.ID
+					err = tx.QueryRow(`SELECT organization_id FROM identities WHERE id = ?`, item.IdentityID).Scan(&identityOrgID)
+					assert.NilError(t, err)
+
+					var groupOrgID uid.ID
+					err = tx.QueryRow(`SELECT organization_id FROM groups WHERE id = ?`, item.GroupID).Scan(&groupOrgID)
+					assert.NilError(t, err)
+
+					assert.Equal(t, identityOrgID, groupOrgID)
+				}
+			},
+		},
+		{
+			label: testCaseLine("2022-09-22T13:00:00"),
+			setup: func(t *testing.T, db WriteTxn) {
+				_, err := db.Exec("INSERT INTO provider_users(provider_id, identity_id) VALUES(1001, 1002)")
+				assert.NilError(t, err)
+			},
+			cleanup: func(t *testing.T, db WriteTxn) {
+				_, err := db.Exec("DELETE FROM provider_users")
+				assert.NilError(t, err)
+			},
+			expected: func(t *testing.T, db WriteTxn) {
+				// schema changes are tested with schema comparison
+			},
+		},
+		{
+			label: testCaseLine("2022-10-04T11:44"),
+			setup: func(t *testing.T, db WriteTxn) {
+				_, err := db.Exec(`
+					INSERT INTO destinations(id, name) VALUES
+					(10009, 'with.dot.no.more'),
+					(10010, 'no-dots')`)
+				assert.NilError(t, err)
+			},
+			cleanup: func(t *testing.T, db WriteTxn) {
+				_, err := db.Exec("DELETE FROM destinations")
+				assert.NilError(t, err)
+			},
+			expected: func(t *testing.T, db WriteTxn) {
+				row := db.QueryRow("SELECT name from destinations where id=?", 10009)
+				var name string
+				assert.NilError(t, row.Scan(&name))
+				assert.Equal(t, name, "with_dot_no_more")
+
+				row = db.QueryRow("SELECT name from destinations where id=?", 10010)
+				assert.NilError(t, row.Scan(&name))
+				assert.Equal(t, name, "no-dots")
+			},
+		},
+		{
+			label: testCaseLine("2022-10-05T11:12"),
+			expected: func(t *testing.T, db WriteTxn) {
+				// schema changes are tested with schema comparison
+			},
+		},
+		{
+			label: testCaseLine("2022-10-05T18:00:00"),
+			setup: func(t *testing.T, db WriteTxn) {
+				_, err := db.Exec("INSERT INTO identities(id, name, deleted_at) VALUES(1111, 'hello@example.com', ?)", time.Now())
+				assert.NilError(t, err)
+				_, err = db.Exec("INSERT INTO provider_users(provider_id, identity_id, email) VALUES(9999, 1111, 'hello@example.com')")
+				assert.NilError(t, err)
+				_, err = db.Exec("INSERT INTO provider_users(provider_id, identity_id, email) VALUES(9999, 2222, 'hello@example.com')")
+				assert.NilError(t, err)
+			},
+			cleanup: func(t *testing.T, db WriteTxn) {
+				_, err := db.Exec("DELETE FROM identities")
+				assert.NilError(t, err)
+				_, err = db.Exec("DELETE FROM provider_users")
+				assert.NilError(t, err)
+			},
+			expected: func(t *testing.T, db WriteTxn) {
+				var count int
+				err := db.QueryRow(`SELECT count(*) from provider_users where identity_id = 1111`).Scan(&count)
+				assert.NilError(t, err)
+				assert.Equal(t, count, 0)
+			},
+		},
+		{
+			label: testCaseLine("2022-09-28T13:00"),
+			expected: func(t *testing.T, db WriteTxn) {
+				// schema changes are tested with schema comparison
+			},
+		},
+		{
+			label: testCaseLine("2022-10-17T18:00"),
+			expected: func(t *testing.T, db WriteTxn) {
+				// schema changes are tested with schema comparison
+			},
+		},
+		{
+			label: testCaseLine("2022-10-17T12:40"),
+			setup: func(t *testing.T, tx WriteTxn) {
+				stmt := `
+					INSERT into grants(id, subject, resource, organization_id)
+					VALUES (1001, 'i:abcd', 'any', ?)`
+				_, err := tx.Exec(stmt, defaultOrganizationID)
+				assert.NilError(t, err)
+			},
+			cleanup: func(t *testing.T, tx WriteTxn) {
+				_, err := tx.Exec(`DELETE FROM grants`)
+				assert.NilError(t, err)
+			},
+			expected: func(t *testing.T, tx WriteTxn) {
+				var updateIndex int64
+				err := tx.QueryRow(`SELECT update_index FROM grants`).Scan(&updateIndex)
+				assert.NilError(t, err)
+				assert.Equal(t, updateIndex, int64(2))
+			},
+		},
+		{
+			label: testCaseLine(addDeviceFlowAuthRequestTable().ID),
+			expected: func(t *testing.T, db WriteTxn) {
+				// schema changes are tested with schema comparison
+			},
+		},
+		{
+			label: testCaseLine(modifyDeviceFlowAuthRequestDropApproved().ID),
+			expected: func(t *testing.T, db WriteTxn) {
+				// schema changes are tested with schema comparison
+			},
+		},
+		{
+			label: testCaseLine(addExpiresAtIndices().ID),
+			expected: func(t *testing.T, db WriteTxn) {
+				// schema changes are tested with schema comparison
+			},
+		},
+		{
+			label: testCaseLine("2022-11-07T14:00"),
+			setup: func(t *testing.T, tx WriteTxn) {
+				stmt := `INSERT INTO destinations(id, name) VALUES(12345, 'some')`
+				_, err := tx.Exec(stmt)
+				assert.NilError(t, err)
+			},
+			cleanup: func(t *testing.T, tx WriteTxn) {
+				_, err := tx.Exec(`DELETE FROM destinations`)
+				assert.NilError(t, err)
+			},
+			expected: func(t *testing.T, tx WriteTxn) {
+				var dest destinationsTable
+
+				err := tx.QueryRow(`SELECT id, kind FROM destinations`).Scan(&dest.ID, &dest.Kind)
+				assert.NilError(t, err)
+				expected := destinationsTable{
+					Model: models.Model{ID: 12345},
+					Kind:  models.DestinationKind("kubernetes"),
+				}
+				assert.DeepEqual(t, expected, dest)
+			},
+		},
+		{
+			label: testCaseLine("2022-11-03T13:00"),
+			expected: func(t *testing.T, db WriteTxn) {
+				// schema changes are tested with schema comparison
+			},
+		},
+		{
+			label: testCaseLine("2022-11-10T17:30"),
+			expected: func(t *testing.T, tx WriteTxn) {
+				var orgID uid.ID
+				err := tx.QueryRow(`SELECT ID FROM organizations WHERE id = ?`, defaultOrganizationID).Scan(&orgID)
+				assert.NilError(t, err)
+			},
+		},
+		{
+			label: testCaseLine("2022-11-15T10:00"),
+			expected: func(t *testing.T, tx WriteTxn) {
+				_, err := tx.Exec(`INSERT INTO access_keys(id, issued_for, name) VALUES(10000, 12345, 'foo')`)
+				assert.NilError(t, err)
+				_, err = tx.Exec(`INSERT INTO access_keys(id, issued_for, name) VALUES(10001, 12346, 'foo')`)
+				assert.NilError(t, err)
+			},
+			cleanup: func(t *testing.T, tx WriteTxn) {
+				_, err := tx.Exec(`DELETE FROM access_keys WHERE id IN (10000, 10001)`)
+				assert.NilError(t, err)
+			},
+		},
+		{
+			label: testCaseLine("2022-11-21T11:00"),
+			expected: func(t *testing.T, db WriteTxn) {
+				// schema changes are tested with schema comparison
+			},
+		},
+		{
+			label: testCaseLine(updateAccessKeysTimeoutColumn().ID),
+			expected: func(t *testing.T, db WriteTxn) {
+				// schema changes are tested with schema comparison
 			},
 		},
 	}
@@ -574,8 +891,7 @@ DELETE FROM settings WHERE id=24567;
 
 	var initialSchema string
 	runStep(t, "initial schema", func(t *testing.T) {
-		patch.ModelsSymmetricKey(t)
-		rawDB, err := newRawDB(postgresDriver(t))
+		rawDB, err := newRawDB(NewDBOptions{DSN: database.PostgresDriver(t, "").DSN})
 		assert.NilError(t, err)
 
 		db := &DB{DB: rawDB}
@@ -583,23 +899,25 @@ DELETE FROM settings WHERE id=24567;
 		m := migrator.New(db, opts, nil)
 		assert.NilError(t, m.Migrate())
 
-		initialSchema = dumpSchema(t, os.Getenv("POSTGRESQL_CONNECTION"))
+		initialSchema = dumpSchema(t, os.Getenv("POSTGRESQL_CONNECTION"), "--schema-only")
 
 		_, err = db.Exec("DROP SCHEMA IF EXISTS testing CASCADE")
 		assert.NilError(t, err)
 	})
 
-	db, err := newRawDB(postgresDriver(t))
+	migratedDBDSN := database.PostgresDriver(t, "").DSN
+	rawDB, err := newRawDB(NewDBOptions{DSN: migratedDBDSN})
 	assert.NilError(t, err)
+	db := &DB{DB: rawDB}
 	for i, tc := range testCases {
 		runStep(t, tc.label.Name, func(t *testing.T) {
 			fmt.Printf("    %v: test case %v\n", tc.label.Line, tc.label.Name)
-			run(t, i, tc, &DB{DB: db})
+			run(t, i, tc, db)
 		})
 	}
 
 	runStep(t, "compare initial schema to migrated schema", func(t *testing.T) {
-		migratedSchema := dumpSchema(t, os.Getenv("POSTGRESQL_CONNECTION"))
+		migratedSchema := dumpSchema(t, os.Getenv("POSTGRESQL_CONNECTION"), "--schema-only")
 
 		if golden.FlagUpdate() {
 			writeSchema(t, migratedSchema)
@@ -619,6 +937,38 @@ in ./migrations.go, add a test case to this test, and run the tests again.
 `)
 		}
 	})
+
+	runStep(t, "setup a new DB with the migrated database", func(t *testing.T) {
+		models.SkipSymmetricKey = true
+		t.Cleanup(func() {
+			models.SkipSymmetricKey = false
+		})
+		_, err := NewDB(NewDBOptions{DSN: migratedDBDSN})
+		assert.NilError(t, err)
+	})
+
+	runStep(t, "check test case cleanup", func(t *testing.T) {
+		// delete the default org, that we expect to exist.
+		_, err := db.Exec(` DELETE FROM organizations where id = ?`, defaultOrganizationID)
+		assert.NilError(t, err)
+		_, err = db.Exec(`DELETE FROM settings where organization_id = ?`, defaultOrganizationID)
+		assert.NilError(t, err)
+
+		data := dumpSchema(t, os.Getenv("POSTGRESQL_CONNECTION"),
+			"--section=data",
+			"--exclude-table=testing.migrations",
+			"--inserts",
+			"--no-comments")
+		stmts, err := schema.TrimComments(data)
+		assert.NilError(t, err)
+
+		if !assert.Check(t, is.Equal(stmts, "")) {
+			t.Log(`
+Stale data was left over from a migration test case. Make sure the cleanup
+function in the test case removes all rows that are added by the setup function
+and the migration.`)
+		}
+	})
 }
 
 func parseTime(t *testing.T, s string) time.Time {
@@ -626,6 +976,12 @@ func parseTime(t *testing.T, s string) time.Time {
 	v, err := time.Parse(time.RFC3339Nano, s)
 	assert.NilError(t, err)
 	return v
+}
+
+func runStep(t *testing.T, name string, fn func(t *testing.T)) {
+	if !t.Run(name, fn) {
+		t.FailNow()
+	}
 }
 
 // testCaseLine is motivated by this Go proposal https://github.com/golang/go/issues/52751.
@@ -646,7 +1002,9 @@ type testCaseLabel struct {
 	Line string
 }
 
-func dumpSchema(t *testing.T, conn string) string {
+var isEnvironmentCI = os.Getenv("CI") != ""
+
+func dumpSchema(t *testing.T, conn string, args ...string) string {
 	t.Helper()
 	if _, err := exec.LookPath("pg_dump"); err != nil {
 		msg := "pg_dump is required to run this test. Install pg_dump or set $PATH to include it."
@@ -682,7 +1040,8 @@ func dumpSchema(t *testing.T, conn string) string {
 
 	out := new(bytes.Buffer)
 	// https://www.postgresql.org/docs/current/app-pgdump.html
-	cmd := exec.Command("pg_dump", "--no-owner", "--no-tablespaces", "--schema-only", "--schema=testing")
+	args = append(args, "--no-owner", "--no-tablespaces", "--schema=testing")
+	cmd := exec.Command("pg_dump", args...)
 	cmd.Env = envs
 	cmd.Stdout = out
 	cmd.Stderr = os.Stderr

@@ -198,7 +198,7 @@ func TestValidate(t *testing.T) {
 	}{
 		{
 			name:     "invalid URL",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: "example.com"}, "some_client_secret", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: "example.com"}, "some_client_secret", "https://example.com/callback"),
 			verifyFunc: func(t *testing.T, err error) {
 				var vErr validate.Error
 				assert.Assert(t, errors.As(err, &vErr), "expected validation error")
@@ -208,7 +208,7 @@ func TestValidate(t *testing.T) {
 		},
 		{
 			name:     "invalid client ID",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "invalid-client-id"}, "some_client_secret", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "invalid-client-id"}, "some_client_secret", "https://example.com/callback"),
 			tokenResponse: tokenResponse{
 				code: 500,
 				body: oktaInvalidClientIDResp,
@@ -222,7 +222,7 @@ func TestValidate(t *testing.T) {
 		},
 		{
 			name:     "invalid client secret",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "https://example.com/callback"),
 			tokenResponse: tokenResponse{
 				code: 500,
 				body: oktaInvalidClientSecretResp,
@@ -237,7 +237,7 @@ func TestValidate(t *testing.T) {
 
 		{
 			name:     "valid provider client",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "https://example.com/callback"),
 			tokenResponse: tokenResponse{
 				code: 500,
 				body: oktaInvalidAuthCodeResp,
@@ -265,62 +265,50 @@ func TestExchangeAuthCodeForProviderToken(t *testing.T) {
 		name          string
 		provider      OIDCClient
 		tokenResponse func(t *testing.T) tokenResponse
-		verifyFunc    func(t *testing.T, accessToken, refreshToken string, accessTokenExpiry time.Time, email string, err error)
+		verifyFunc    func(t *testing.T, auth *IdentityProviderAuth, err error)
 	}{
 		{
 			name:     "invalid provider client fails",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "invalid"}, "invalid", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "invalid"}, "invalid", "https://example.com/callback"),
 			tokenResponse: func(t *testing.T) tokenResponse {
 				return tokenResponse{
 					code: 500,
 					body: oktaInvalidClientIDResp,
 				}
 			},
-			verifyFunc: func(t *testing.T, accessToken, refreshToken string, accessTokenExpiry time.Time, email string, err error) {
+			verifyFunc: func(t *testing.T, auth *IdentityProviderAuth, err error) {
 				assert.ErrorContains(t, err, "Invalid value for 'client_id' parameter")
-				assert.Equal(t, accessToken, "")
-				assert.Equal(t, refreshToken, "")
-				assert.Assert(t, accessTokenExpiry.IsZero())
-				assert.Equal(t, email, "")
 			},
 		},
 		{
 			name:     "invalid auth code fails",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "https://example.com/callback"),
 			tokenResponse: func(t *testing.T) tokenResponse {
 				return tokenResponse{
 					code: 500,
 					body: oktaInvalidAuthCodeResp,
 				}
 			},
-			verifyFunc: func(t *testing.T, accessToken, refreshToken string, accessTokenExpiry time.Time, email string, err error) {
+			verifyFunc: func(t *testing.T, auth *IdentityProviderAuth, err error) {
 				assert.ErrorContains(t, err, "authorization code is invalid")
-				assert.Equal(t, accessToken, "")
-				assert.Equal(t, refreshToken, "")
-				assert.Assert(t, accessTokenExpiry.IsZero())
-				assert.Equal(t, email, "")
 			},
 		},
 		{
 			name:     "empty access token response fails",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "https://example.com/callback"),
 			tokenResponse: func(t *testing.T) tokenResponse {
 				return tokenResponse{
 					code: 200,
 					body: `{"access_token": ""}`,
 				}
 			},
-			verifyFunc: func(t *testing.T, accessToken, refreshToken string, accessTokenExpiry time.Time, email string, err error) {
+			verifyFunc: func(t *testing.T, auth *IdentityProviderAuth, err error) {
 				assert.ErrorContains(t, err, "server response missing access_token")
-				assert.Equal(t, accessToken, "")
-				assert.Equal(t, refreshToken, "")
-				assert.Assert(t, accessTokenExpiry.IsZero())
-				assert.Equal(t, email, "")
 			},
 		},
 		{
 			name:     "id token issued by a different provider fails",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "https://example.com/callback"),
 			tokenResponse: func(t *testing.T) tokenResponse {
 				claims := jwt.Claims{
 					Issuer: "unknown-issuer",
@@ -335,17 +323,13 @@ func TestExchangeAuthCodeForProviderToken(t *testing.T) {
 					body: body,
 				}
 			},
-			verifyFunc: func(t *testing.T, accessToken, refreshToken string, accessTokenExpiry time.Time, email string, err error) {
+			verifyFunc: func(t *testing.T, auth *IdentityProviderAuth, err error) {
 				assert.ErrorContains(t, err, "id token issued by a different provider")
-				assert.Equal(t, accessToken, "")
-				assert.Equal(t, refreshToken, "")
-				assert.Assert(t, accessTokenExpiry.IsZero())
-				assert.Equal(t, email, "")
 			},
 		},
 		{
 			name:     "id token issued for wrong audience fails",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "https://example.com/callback"),
 			tokenResponse: func(t *testing.T) tokenResponse {
 				claims := jwt.Claims{
 					Issuer:   "https://" + serverURL,
@@ -361,17 +345,13 @@ func TestExchangeAuthCodeForProviderToken(t *testing.T) {
 					body: body,
 				}
 			},
-			verifyFunc: func(t *testing.T, accessToken, refreshToken string, accessTokenExpiry time.Time, email string, err error) {
+			verifyFunc: func(t *testing.T, auth *IdentityProviderAuth, err error) {
 				assert.ErrorContains(t, err, "expected audience \"client-id\"")
-				assert.Equal(t, accessToken, "")
-				assert.Equal(t, refreshToken, "")
-				assert.Assert(t, accessTokenExpiry.IsZero())
-				assert.Equal(t, email, "")
 			},
 		},
 		{
 			name:     "expired id token fails",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "https://example.com/callback"),
 			tokenResponse: func(t *testing.T) tokenResponse {
 				now := time.Now().UTC()
 
@@ -392,17 +372,13 @@ func TestExchangeAuthCodeForProviderToken(t *testing.T) {
 					body: body,
 				}
 			},
-			verifyFunc: func(t *testing.T, accessToken, refreshToken string, accessTokenExpiry time.Time, email string, err error) {
+			verifyFunc: func(t *testing.T, auth *IdentityProviderAuth, err error) {
 				assert.ErrorContains(t, err, "token is expired")
-				assert.Equal(t, accessToken, "")
-				assert.Equal(t, refreshToken, "")
-				assert.Assert(t, accessTokenExpiry.IsZero())
-				assert.Equal(t, email, "")
 			},
 		},
 		{
 			name:     "id token without email claim fails",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "https://example.com/callback"),
 			tokenResponse: func(t *testing.T) tokenResponse {
 				now := time.Now().UTC()
 
@@ -423,17 +399,13 @@ func TestExchangeAuthCodeForProviderToken(t *testing.T) {
 					body: body,
 				}
 			},
-			verifyFunc: func(t *testing.T, accessToken, refreshToken string, accessTokenExpiry time.Time, email string, err error) {
+			verifyFunc: func(t *testing.T, auth *IdentityProviderAuth, err error) {
 				assert.ErrorContains(t, err, "missing an email address")
-				assert.Equal(t, accessToken, "")
-				assert.Equal(t, refreshToken, "")
-				assert.Assert(t, accessTokenExpiry.IsZero())
-				assert.Equal(t, email, "")
 			},
 		},
 		{
 			name:     "empty email claim fails",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "https://example.com/callback"),
 			tokenResponse: func(t *testing.T) tokenResponse {
 				now := time.Now().UTC()
 
@@ -454,17 +426,13 @@ func TestExchangeAuthCodeForProviderToken(t *testing.T) {
 					body: body,
 				}
 			},
-			verifyFunc: func(t *testing.T, accessToken, refreshToken string, accessTokenExpiry time.Time, email string, err error) {
+			verifyFunc: func(t *testing.T, auth *IdentityProviderAuth, err error) {
 				assert.ErrorContains(t, err, "claim has invalid email address")
-				assert.Equal(t, accessToken, "")
-				assert.Equal(t, refreshToken, "")
-				assert.Assert(t, accessTokenExpiry.IsZero())
-				assert.Equal(t, email, "")
 			},
 		},
 		{
 			name:     "valid id token is successful",
-			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "http://localhost:8301"),
+			provider: NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "client-id"}, "some_client_secret", "https://example.com/callback"),
 			tokenResponse: func(t *testing.T) tokenResponse {
 				now := time.Now().UTC()
 
@@ -485,12 +453,12 @@ func TestExchangeAuthCodeForProviderToken(t *testing.T) {
 					body: body,
 				}
 			},
-			verifyFunc: func(t *testing.T, accessToken, refreshToken string, accessTokenExpiry time.Time, email string, err error) {
+			verifyFunc: func(t *testing.T, auth *IdentityProviderAuth, err error) {
 				assert.NilError(t, err)
-				assert.Assert(t, accessToken != "")
-				assert.Assert(t, refreshToken != "")
-				assert.Assert(t, !accessTokenExpiry.IsZero())
-				assert.Equal(t, email, "hello@example.com")
+				assert.Assert(t, auth.AccessToken != "")
+				assert.Assert(t, auth.RefreshToken != "")
+				assert.Assert(t, !auth.AccessTokenExpiry.IsZero())
+				assert.Equal(t, auth.Email, "hello@example.com")
 			},
 		},
 	}
@@ -498,8 +466,8 @@ func TestExchangeAuthCodeForProviderToken(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			server.tokenResponse = test.tokenResponse(t)
-			accToken, refToken, accTokenExp, email, err := test.provider.ExchangeAuthCodeForProviderTokens(ctx, "some-auth-code")
-			test.verifyFunc(t, accToken, refToken, accTokenExp, email, err)
+			auth, err := test.provider.ExchangeAuthCodeForProviderTokens(ctx, "some-auth-code")
+			test.verifyFunc(t, auth, err)
 		})
 	}
 }
@@ -507,7 +475,7 @@ func TestExchangeAuthCodeForProviderToken(t *testing.T) {
 func TestRefreshAccessToken(t *testing.T) {
 	server, ctx := setupOIDCTest(t, "")
 	serverURL := server.run(t, nil)
-	provider := NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "whatever"}, "secret", "http://localhost:8301")
+	provider := NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "whatever"}, "secret", "https://example.com/callback")
 
 	now := time.Now().UTC()
 
@@ -661,7 +629,7 @@ func TestOIDC_GetUserInfo(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			server, ctx := setupOIDCTest(t, test.infoResponse)
 			serverURL := server.run(t, nil)
-			provider := NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "invalid"}, "invalid", "http://localhost:8301")
+			provider := NewOIDCClient(models.Provider{Kind: models.ProviderKindOIDC, URL: serverURL, ClientID: "invalid"}, "invalid", "https://example.com/callback")
 			info, err := provider.GetUserInfo(ctx, &models.ProviderUser{AccessToken: "aaa", RefreshToken: "bbb", ExpiresAt: time.Now().UTC().Add(5 * time.Minute)})
 			test.verifyFunc(t, info, err)
 		})
