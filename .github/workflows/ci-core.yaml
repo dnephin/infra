@@ -2,6 +2,8 @@ name: ci / core
 
 on:
   push: {}
+  schedule:
+    - cron: '13 16 * * *'
 
 jobs:
   test-matrix:
@@ -13,7 +15,7 @@ jobs:
           go-version: '1.19'
           cache: true
       - run: go mod download -x
-      - run: go install gotest.tools/gotestsum@59954ddc727bf5a476515780fac6e3e4f9c60957
+      - run: go install gotest.tools/gotestsum@d0adc241710a44f874fccf54e821fc6c5c430616
 
       - run: mkdir -p /home/runner/reports
       - uses: actions/cache@v3
@@ -25,11 +27,12 @@ jobs:
       - name: build matrix
         id: build
         run: |
-          echo -n "::set-output name=matrix::"
-          go list ./... | gotestsum tool ci-matrix --debug \
-            --max-age-days 10 \
-            --partitions 3 \
-            --timing-files '/home/runner/reports/*.log'
+          (
+            echo -n "matrix="
+            go list ./... | gotestsum tool ci-matrix --debug \
+              --partitions 3 \
+              --timing-files '/home/runner/reports/*.log'
+          ) >> $GITHUB_OUTPUT
 
     outputs:
       matrix: ${{ steps.build.outputs.matrix }}
@@ -46,7 +49,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:12-alpine
+        image: postgres:14-alpine
         env:
           POSTGRES_PASSWORD: password123
         options: >-
@@ -74,7 +77,7 @@ jobs:
           mkdir -p /home/runner/reports
           ~/go/bin/gotestsum -ftestname \
               --jsonfile=/home/runner/reports/test-run-${{github.run_number}}-${{matrix.id}}.log \
-              -- -race ${{ join(matrix.packages, ' ') }}
+              -- -race ${{matrix.packages}}
 
         env:
           POSTGRESQL_CONNECTION: "host=localhost port=5432 user=postgres dbname=postgres password=password123"
@@ -110,7 +113,10 @@ jobs:
         with:
           name: test-reports
           path: /home/runner/reports
-      - run: ls -lhR /home/runner/reports
+      - run: |
+          ls -lhR /home/runner/reports
+          find /home/runner/reports/ -mindepth 1 -mtime +3 -delete
+          ls -lhR /home/runner/reports
 
   test:
     runs-on: ubuntu-latest
@@ -120,15 +126,3 @@ jobs:
       - run: |
           RESULT="${{ needs.go-test.result }}"
           [ "$RESULT" = 'success' ] || [ "$RESULT" = 'skipped' ] || exit 1
-
-  check-generated:
-          name: build-log
-          path: compile.json
-      - name: Check go mod is tidy
-        run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
-      - name: Check generated code is updated
-        run: |
-          go generate ./...
-          git diff --exit-code
