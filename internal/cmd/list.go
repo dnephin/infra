@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -16,7 +17,7 @@ func newListCmd(cli *CLI) *cobra.Command {
 		Aliases: []string{"ls"},
 		Short:   "List accessible destinations",
 		Args:    NoArgs,
-		Group:   "Core commands:",
+		GroupID: groupCore,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			if err := rootPreRun(cmd.Flags()); err != nil {
 				return err
@@ -35,20 +36,30 @@ func list(cli *CLI) error {
 		return err
 	}
 
-	user, destinations, grants, err := getUserDestinationGrants(client)
+	user, destinations, grants, err := getUserDestinationGrants(client, "kubernetes")
 	if err != nil {
 		return err
 	}
 
-	gs := make(map[string]map[string]struct{})
+	grantsByResource := make(map[string]map[string]struct{})
+	resources := []string{}
 	for _, g := range grants {
-		// aggregate privileges
-		if gs[g.Resource] == nil {
-			gs[g.Resource] = make(map[string]struct{})
+		if isResourceForDestination(g.Resource, "infra") {
+			continue
 		}
 
-		gs[g.Resource][g.Privilege] = struct{}{}
+		if !destinationForResourceExists(g.Resource, destinations) {
+			continue
+		}
+
+		if grantsByResource[g.Resource] == nil {
+			grantsByResource[g.Resource] = make(map[string]struct{})
+			resources = append(resources, g.Resource)
+		}
+
+		grantsByResource[g.Resource][g.Privilege] = struct{}{}
 	}
+	sort.Strings(resources)
 
 	type row struct {
 		Name   string `header:"NAME"`
@@ -56,32 +67,8 @@ func list(cli *CLI) error {
 	}
 
 	var rows []row
-
-	keys := make([]string, 0, len(gs))
-	for k := range gs {
-		if strings.HasPrefix(k, "infra") {
-			continue
-		}
-
-		var exists bool
-		for _, d := range destinations {
-			if strings.HasPrefix(k, d.Name) {
-				exists = true
-				break
-			}
-		}
-
-		if !exists {
-			continue
-		}
-
-		keys = append(keys, k)
-	}
-
-	sort.Strings(keys)
-
-	for _, k := range keys {
-		v, ok := gs[k]
+	for _, k := range resources {
+		v, ok := grantsByResource[k]
 		if !ok {
 			// should not be possible
 			return fmt.Errorf("unexpected value in grants: %s", k)
@@ -107,7 +94,29 @@ func list(cli *CLI) error {
 	return writeKubeconfig(user, destinations, grants)
 }
 
-func getUserDestinationGrants(client *api.Client) (*api.User, []api.Destination, []api.Grant, error) {
+func destinationForResourceExists(resource string, destinations []api.Destination) bool {
+	for _, d := range destinations {
+		if !isResourceForDestination(resource, d.Name) {
+			continue
+		}
+
+		return isDestinationAvailable(d)
+	}
+
+	return false
+}
+
+func isDestinationAvailable(destination api.Destination) bool {
+	return destination.Connected && destination.Connection.URL != ""
+}
+
+func isResourceForDestination(resource string, destination string) bool {
+	return resource == destination || strings.HasPrefix(resource, destination+".")
+}
+
+func getUserDestinationGrants(client *api.Client, kind string) (*api.User, []api.Destination, []api.Grant, error) {
+	ctx := context.TODO()
+
 	config, err := currentHostConfig()
 	if err != nil {
 		return nil, nil, nil, err
@@ -117,17 +126,17 @@ func getUserDestinationGrants(client *api.Client) (*api.User, []api.Destination,
 		return nil, nil, nil, fmt.Errorf("no active identity")
 	}
 
-	user, err := client.GetUser(config.UserID)
+	user, err := client.GetUser(ctx, config.UserID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	grants, err := listAll(client.ListGrants, api.ListGrantsRequest{User: config.UserID, ShowInherited: true})
+	grants, err := listAll(ctx, client.ListGrants, api.ListGrantsRequest{User: config.UserID, ShowInherited: true})
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	destinations, err := listAll(client.ListDestinations, api.ListDestinationsRequest{})
+	destinations, err := listAll(ctx, client.ListDestinations, api.ListDestinationsRequest{Kind: kind})
 	if err != nil {
 		return nil, nil, nil, err
 	}

@@ -20,7 +20,7 @@ type AuthenticatedIdentity struct {
 }
 
 type LoginMethod interface {
-	Authenticate(ctx context.Context, db data.GormTxn, requestedExpiry time.Time) (AuthenticatedIdentity, error)
+	Authenticate(ctx context.Context, db *data.Transaction, requestedExpiry time.Time) (AuthenticatedIdentity, error)
 	Name() string // Name returns the name of the authentication method used
 }
 
@@ -33,14 +33,15 @@ type LoginResult struct {
 	Bearer                   string
 	User                     *models.Identity
 	CredentialUpdateRequired bool
+	OrganizationName         string
 }
 
 func Login(
 	ctx context.Context,
-	db data.GormTxn,
+	db *data.Transaction,
 	loginMethod LoginMethod,
 	requestedExpiry time.Time,
-	keyExtension time.Duration,
+	inactivityTimeout time.Duration,
 ) (LoginResult, error) {
 	// challenge the user to authenticate
 	authenticated, err := loginMethod.Authenticate(ctx, db, requestedExpiry)
@@ -51,12 +52,13 @@ func Login(
 	// login authentication was successful, create an access key for the user
 
 	accessKey := &models.AccessKey{
-		IssuedFor:         authenticated.Identity.ID,
-		IssuedForIdentity: authenticated.Identity,
-		ProviderID:        authenticated.Provider.ID,
-		ExpiresAt:         authenticated.SessionExpiry,
-		ExtensionDeadline: time.Now().UTC().Add(keyExtension),
-		Extension:         keyExtension,
+		IssuedFor:           authenticated.Identity.ID,
+		IssuedForName:       authenticated.Identity.Name,
+		ProviderID:          authenticated.Provider.ID,
+		ExpiresAt:           authenticated.SessionExpiry,
+		InactivityTimeout:   time.Now().UTC().Add(inactivityTimeout),
+		InactivityExtension: inactivityTimeout,
+		Scopes:              models.CommaSeparatedStrings{models.ScopeAllowCreateAccessKey},
 	}
 
 	if authenticated.AuthScope.PasswordResetOnly {
@@ -69,8 +71,13 @@ func Login(
 	}
 
 	authenticated.Identity.LastSeenAt = time.Now().UTC()
-	if err := data.SaveIdentity(db, authenticated.Identity); err != nil {
+	if err := data.UpdateIdentity(db, authenticated.Identity); err != nil {
 		return LoginResult{}, fmt.Errorf("login failed to update last seen: %w", err)
+	}
+
+	org, err := data.GetOrganization(db, data.GetOrganizationOptions{ByID: accessKey.OrganizationID})
+	if err != nil {
+		return LoginResult{}, err
 	}
 
 	return LoginResult{
@@ -78,5 +85,6 @@ func Login(
 		Bearer:                   bearer,
 		User:                     authenticated.Identity,
 		CredentialUpdateRequired: authenticated.CredentialUpdateRequired,
+		OrganizationName:         org.Name,
 	}, nil
 }

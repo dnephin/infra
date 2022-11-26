@@ -4,13 +4,17 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"gotest.tools/v3/assert"
 
 	"github.com/infrahq/infra/api"
 	"github.com/infrahq/infra/internal"
+	"github.com/infrahq/infra/internal/access"
 	"github.com/infrahq/infra/internal/server/data"
+	"github.com/infrahq/infra/internal/server/models"
+	"github.com/infrahq/infra/uid"
 )
 
 func TestAPI_Signup(t *testing.T) {
@@ -29,8 +33,7 @@ func TestAPI_Signup(t *testing.T) {
 		body := tc.setup(t)
 
 		// nolint:noctx
-		req, err := http.NewRequest(http.MethodPost, "/api/signup", jsonBody(t, body))
-		assert.NilError(t, err)
+		req := httptest.NewRequest(http.MethodPost, "/api/signup", jsonBody(t, body))
 		req.Header.Set("Infra-Version", apiVersionLatest)
 
 		resp := httptest.NewRecorder()
@@ -61,7 +64,7 @@ func TestAPI_Signup(t *testing.T) {
 
 				expected := []api.FieldError{
 					{FieldName: "org.subDomain", Errors: []string{
-						"must be at least 3 characters",
+						"must be at least 4 characters",
 						"character '@' at position 1 is not allowed",
 					}},
 				}
@@ -76,7 +79,7 @@ func TestAPI_Signup(t *testing.T) {
 					Password: "short",
 					Org: api.SignupOrg{
 						Name:      "My org is awesome",
-						Subdomain: "hello",
+						Subdomain: "helloo",
 					},
 				}
 			},
@@ -95,7 +98,9 @@ func TestAPI_Signup(t *testing.T) {
 				assert.DeepEqual(t, respBody.FieldErrors, expected)
 
 				// the org should have been rolled back
-				_, err = data.GetOrganization(srv.DB(), data.ByDomain("hello.exampledomain.com"))
+				_, err = data.GetOrganization(srv.DB(), data.GetOrganizationOptions{
+					ByDomain: "hello.exampledomain.com",
+				})
 				assert.ErrorIs(t, err, internal.ErrNotFound)
 			},
 		},
@@ -131,7 +136,7 @@ func TestAPI_Signup(t *testing.T) {
 				return api.SignupRequest{
 					Name:     "admin@example.com",
 					Password: "password",
-					Org:      api.SignupOrg{Name: "acme", Subdomain: "acme"},
+					Org:      api.SignupOrg{Name: "acme", Subdomain: "acme-co"},
 				}
 			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
@@ -145,12 +150,43 @@ func TestAPI_Signup(t *testing.T) {
 			},
 		},
 		{
+			name: "duplicate organization name",
+			setup: func(t *testing.T) api.SignupRequest {
+				err := data.CreateOrganization(srv.DB(), &models.Organization{
+					Name:   "Something",
+					Domain: "taken.exampledomain.com",
+				})
+				assert.NilError(t, err)
+
+				return api.SignupRequest{
+					Name:     "admin@example.com",
+					Password: "password",
+					Org:      api.SignupOrg{Name: "Example", Subdomain: "taken"},
+				}
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				assert.Equal(t, resp.Code, http.StatusConflict, resp.Body.String())
+
+				respBody := &api.Error{}
+				err := json.Unmarshal(resp.Body.Bytes(), respBody)
+				assert.NilError(t, err)
+
+				expected := []api.FieldError{
+					{
+						FieldName: "org.subDomain",
+						Errors:    []string{"an organization with that domain already exists"},
+					},
+				}
+				assert.DeepEqual(t, respBody.FieldErrors, expected)
+			},
+		},
+		{
 			name: "successful signup",
 			setup: func(t *testing.T) api.SignupRequest {
 				return api.SignupRequest{
 					Name:     "admin@example.com",
 					Password: "password",
-					Org:      api.SignupOrg{Name: "acme", Subdomain: "acme"},
+					Org:      api.SignupOrg{Name: "acme", Subdomain: "acme-co"},
 				}
 			},
 			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
@@ -163,9 +199,14 @@ func TestAPI_Signup(t *testing.T) {
 
 				assert.Equal(t, respBody.User.Name, "admin@example.com")
 				assert.Equal(t, respBody.Organization.Name, "acme")
+				assert.DeepEqual(t, respBody.Organization.AllowedDomains, []string{"example.com"})
+				userID := respBody.User.ID
+				orgID := respBody.Organization.ID
 
 				// the organization exists
-				org, err := data.GetOrganization(srv.DB(), data.ByDomain("acme.exampledomain.com"))
+				org, err := data.GetOrganization(srv.DB(), data.GetOrganizationOptions{
+					ByDomain: "acme-co.exampledomain.com",
+				})
 				assert.NilError(t, err)
 				assert.Equal(t, org.ID, respBody.Organization.ID)
 
@@ -176,8 +217,7 @@ func TestAPI_Signup(t *testing.T) {
 
 				key := cookies[0].Value
 				// nolint:noctx
-				req, err := http.NewRequest(http.MethodGet, "/api/users/self", nil)
-				assert.NilError(t, err)
+				req := httptest.NewRequest(http.MethodGet, "/api/users/self", nil)
 				req.Header.Set("Infra-Version", apiVersionLatest)
 				req.Header.Set("Authorization", "Bearer "+key)
 
@@ -190,7 +230,64 @@ func TestAPI_Signup(t *testing.T) {
 				assert.NilError(t, err)
 				assert.Equal(t, userResp.ID, respBody.User.ID)
 
-				// TODO: check the user is an admin
+				// check the user is an admin
+				tx := txnForTestCase(t, srv.db, orgID)
+				_, err = data.GetGrant(tx, data.GetGrantOptions{
+					BySubject:   uid.NewIdentityPolymorphicID(userID),
+					ByResource:  access.ResourceInfraAPI,
+					ByPrivilege: api.InfraAdminRole,
+				})
+				assert.NilError(t, err)
+
+				// check their access token has the expected scope
+				k, err := data.GetAccessKeyByKeyID(srv.DB(), strings.Split(key, ".")[0])
+				assert.NilError(t, err)
+
+				assert.DeepEqual(t, k.Scopes, models.CommaSeparatedStrings{models.ScopeAllowCreateAccessKey})
+			},
+		},
+		{
+			name: "successful signup with gmail",
+			setup: func(t *testing.T) api.SignupRequest {
+				return api.SignupRequest{
+					Name:     "example@gmail.com",
+					Password: "password",
+					Org:      api.SignupOrg{Name: "acme-goog", Subdomain: "acme-goog-co"},
+				}
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				// the response is success
+				assert.Equal(t, resp.Code, http.StatusCreated, resp.Body.String())
+
+				respBody := &api.SignupResponse{}
+				err := json.NewDecoder(resp.Body).Decode(respBody)
+				assert.NilError(t, err)
+
+				assert.Equal(t, respBody.User.Name, "example@gmail.com")
+				assert.Equal(t, respBody.Organization.Name, "acme-goog")
+				assert.DeepEqual(t, respBody.Organization.AllowedDomains, []string{""}) // this is empty by default for gmail
+			},
+		},
+		{
+			name: "successful signup with googlemail",
+			setup: func(t *testing.T) api.SignupRequest {
+				return api.SignupRequest{
+					Name:     "example@googlemail.com",
+					Password: "password",
+					Org:      api.SignupOrg{Name: "acme-googmail", Subdomain: "acme-goog-mail-co"},
+				}
+			},
+			expected: func(t *testing.T, resp *httptest.ResponseRecorder) {
+				// the response is success
+				assert.Equal(t, resp.Code, http.StatusCreated, resp.Body.String())
+
+				respBody := &api.SignupResponse{}
+				err := json.NewDecoder(resp.Body).Decode(respBody)
+				assert.NilError(t, err)
+
+				assert.Equal(t, respBody.User.Name, "example@googlemail.com")
+				assert.Equal(t, respBody.Organization.Name, "acme-googmail")
+				assert.DeepEqual(t, respBody.Organization.AllowedDomains, []string{""}) // this is empty by default for gmail
 			},
 		},
 	}

@@ -18,25 +18,23 @@ func CreateDestination(c *gin.Context, destination *models.Destination) error {
 	return data.CreateDestination(db, destination)
 }
 
-func SaveDestination(c *gin.Context, destination *models.Destination) error {
+func UpdateDestination(rCtx RequestContext, destination *models.Destination) error {
 	roles := []string{models.InfraAdminRole, models.InfraConnectorRole}
-	db, err := RequireInfraRole(c, roles...)
-	if err != nil {
+	if err := IsAuthorized(rCtx, roles...); err != nil {
 		return HandleAuthErr(err, "destination", "update", roles...)
 	}
 
-	return data.SaveDestination(db, destination)
+	return data.UpdateDestination(rCtx.DBTxn, destination)
 }
 
 func GetDestination(c *gin.Context, id uid.ID) (*models.Destination, error) {
-	db := getDB(c)
-	return data.GetDestination(db, data.ByID(id))
+	rCtx := GetRequestContext(c)
+	return data.GetDestination(rCtx.DBTxn, data.GetDestinationOptions{ByID: id})
 }
 
-func ListDestinations(c *gin.Context, uniqueID, name string, p *data.Pagination) ([]models.Destination, error) {
-	db := getDB(c)
-	return data.ListDestinations(db, p, data.ByOptionalUniqueID(uniqueID),
-		data.ByOptionalName(name))
+func ListDestinations(c *gin.Context, opts data.ListDestinationsOptions) ([]models.Destination, error) {
+	rCtx := GetRequestContext(c)
+	return data.ListDestinations(rCtx.DBTxn, opts)
 }
 
 func DeleteDestination(c *gin.Context, id uid.ID) error {
@@ -45,5 +43,5 @@ func DeleteDestination(c *gin.Context, id uid.ID) error {
 		return HandleAuthErr(err, "destination", "delete", models.InfraAdminRole)
 	}
 
-	return data.DeleteDestinations(db, data.ByID(id))
+	return data.DeleteDestination(db, id)
 }

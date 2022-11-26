@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -11,101 +10,120 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 
 	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/access"
 	"github.com/infrahq/infra/internal/logging"
 	"github.com/infrahq/infra/internal/server/data"
 	"github.com/infrahq/infra/internal/server/models"
+	"github.com/infrahq/infra/internal/server/redis"
 )
 
-// TimeoutMiddleware adds a timeout to the request context within the Gin context.
-// To correctly abort long-running requests, this depends on the users of the context to
-// stop working when the context cancels.
-// Note: The goroutine for the request is never halted; if the context is not
-// passed down to lower packages and long-running tasks, then the app will not
-// magically stop working on the request. No effort should be made to write
-// an early http response here; it's up to the users of the context to watch for
-// c.Request.Context().Err() or <-c.Request.Context().Done()
-func TimeoutMiddleware(timeout time.Duration) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
-		defer cancel()
-		c.Request = c.Request.WithContext(ctx)
-		c.Next()
-	}
-}
-
-func handleInfraDestinationHeader(c *gin.Context) error {
-	uniqueID := c.Request.Header.Get("Infra-Destination")
-	if uniqueID == "" {
-		return nil
+func handleInfraDestinationHeader(rCtx access.RequestContext, headers http.Header) error {
+	opts := data.GetDestinationOptions{}
+	if name := headers.Get(headerInfraDestinationName); name != "" {
+		opts.ByName = name
+	} else if uniqueID := headers.Get(headerInfraDestinationUniqueID); uniqueID != "" {
+		opts.ByUniqueID = uniqueID
+	} else {
+		return nil // no header
 	}
 
-	// TODO: use GetDestination(ByUniqueID())
-	destinations, err := access.ListDestinations(c, uniqueID, "", &data.Pagination{Limit: 1})
-	if err != nil {
+	destination, err := data.GetDestination(rCtx.DBTxn, opts)
+	switch {
+	case errors.Is(err, internal.ErrNotFound):
+		return nil // destination does not exist yet
+	case err != nil:
 		return err
 	}
 
-	switch len(destinations) {
-	case 0:
-		// destination does not exist yet, noop
-		return nil
-	case 1:
-		destination := destinations[0]
-		// only save if there's significant difference between LastSeenAt and Now
-		if time.Since(destination.LastSeenAt) > time.Second {
-			destination.LastSeenAt = time.Now()
-			if err := access.SaveDestination(c, &destination); err != nil {
-				return fmt.Errorf("failed to update destination lastSeenAt: %w", err)
-			}
+	// only save if there's significant difference between LastSeenAt and Now
+	if time.Since(destination.LastSeenAt) > lastSeenUpdateThreshold {
+		destination.LastSeenAt = time.Now()
+		if err := access.UpdateDestination(rCtx, destination); err != nil {
+			return fmt.Errorf("failed to update destination lastSeenAt: %w", err)
 		}
-		return nil
-	default:
-		return fmt.Errorf("multiple destinations found for unique ID %q", uniqueID)
 	}
+	return nil
 }
 
-// authenticatedMiddleware is applied to all routes that require authentication.
-// It validates the access key, and updates the lastSeenAt of the user, and
-// possibly also of the destination.
-func authenticatedMiddleware(srv *Server) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		withDBTxn(c.Request.Context(), srv.DB().GormDB(), func(db *gorm.DB) {
-			tx := data.NewTransaction(db, 0)
-			authned, err := requireAccessKey(c, tx, srv)
-			if err != nil {
-				sendAPIError(c, err)
-				return
-			}
+const (
+	headerInfraDestinationUniqueID = "Infra-Destination"
+	headerInfraDestinationName     = "Infra-Destination-Name"
+)
 
-			if _, err := validateOrgMatchesRequest(c.Request, tx, authned.Organization); err != nil {
-				logging.L.Warn().Err(err).Msg("org validation failed")
-				sendAPIError(c, internal.ErrBadRequest)
-				return
-			}
-
-			tx = data.NewTransaction(db, authned.Organization.ID)
-			rCtx := access.RequestContext{
-				Request:       c.Request,
-				DBTxn:         tx,
-				Authenticated: authned,
-			}
-			c.Set(access.RequestContextKey, rCtx)
-
-			// TODO: remove once everything uses RequestContext
-			c.Set("identity", authned.User)
-
-			if err := handleInfraDestinationHeader(c); err != nil {
-				sendAPIError(c, err)
-				return
-			}
-			c.Next()
-		})
+// authenticateRequest authenticates the user performing the request.
+//
+// If the route requires authentication, authenticateRequest validates the access
+// key and organization, updates the lastSeenAt of the user,
+// and may also update the lastSeenAt of the destination if the appropriate header
+// is set.
+//
+// If the route does not require authentication, authenticateRequest will attempt
+// the same authentication, but ignore the error. It will also look up the
+// organization from the domain name when no access key is provided.
+//
+// If the request identifies an organization (which is required for most routes)
+// a rate limit will be applied to all requests from the same organization.
+func authenticateRequest(c *gin.Context, route routeSettings, srv *Server) (access.Authenticated, error) {
+	tx, err := srv.db.Begin(c.Request.Context(), nil)
+	if err != nil {
+		return access.Authenticated{}, err
 	}
+	defer logError(tx.Rollback, "failed to rollback middleware transaction")
+
+	authned, err := requireAccessKey(c, tx, srv)
+	if !route.authenticationOptional && err != nil {
+		return authned, err
+	}
+
+	org, err := validateOrgMatchesRequest(c.Request, tx, authned.Organization)
+	if err != nil {
+		return authned, err
+	}
+
+	if route.authenticationOptional {
+		// See this diagram for more details about this request flow
+		// when an org is not specified.
+		// https://github.com/infrahq/infra/blob/main/docs/dev/organization-request-flow.md
+
+		// TODO: use an explicit setting for this, don't overload EnableSignup
+		if org == nil && !srv.options.EnableSignup { // is single tenant
+			org = srv.db.DefaultOrg
+		}
+		if org == nil && !route.organizationOptional {
+			return authned, fmt.Errorf("%w: missing organization", internal.ErrBadRequest)
+		}
+		authned.Organization = org
+	}
+
+	if org != nil {
+		// TODO: limit should be a per-organization setting
+		if err := redis.NewLimiter(srv.redis).RateOK(org.ID.String(), 5000); err != nil {
+			return authned, err
+		}
+	}
+
+	if authned.User != nil {
+		tx = tx.WithOrgID(authned.Organization.ID)
+		rCtx := access.RequestContext{DBTxn: tx, Authenticated: authned}
+		if err := handleInfraDestinationHeader(rCtx, c.Request.Header); err != nil {
+			return authned, err
+		}
+	}
+
+	err = tx.Commit()
+	return authned, err
 }
+
+// lastSeenUpdateThreshold is the duration of time that must pass before a
+// LastSeenAt value for a user or destination is updated again. This prevents
+// excessive writes when a single user performs many requests in a short
+// period of time.
+//
+// If you change this value, you may also want to change the threshold in
+// data.ValidateRequestAccessKey.
+const lastSeenUpdateThreshold = 2 * time.Second
 
 // validateOrgMatchesRequest checks that if both the accessKeyOrg and the org
 // from the request are set they have the same ID. If only one is set no
@@ -113,7 +131,7 @@ func authenticatedMiddleware(srv *Server) gin.HandlerFunc {
 //
 // Returns the organization from any source that is not nil, or an error if the
 // two sources do not match.
-func validateOrgMatchesRequest(req *http.Request, tx data.GormTxn, accessKeyOrg *models.Organization) (*models.Organization, error) {
+func validateOrgMatchesRequest(req *http.Request, tx data.ReadTxn, accessKeyOrg *models.Organization) (*models.Organization, error) {
 	orgFromRequest, err := getOrgFromRequest(req, tx)
 	if err != nil {
 		return nil, err
@@ -125,77 +143,15 @@ func validateOrgMatchesRequest(req *http.Request, tx data.GormTxn, accessKeyOrg 
 	case accessKeyOrg == nil:
 		return orgFromRequest, nil
 	case orgFromRequest.ID != accessKeyOrg.ID:
-		return nil, fmt.Errorf("org from access key %v does not match org from request %v",
-			accessKeyOrg.ID, orgFromRequest.ID)
+		return nil, fmt.Errorf("%w: org from access key %v does not match org from request %v",
+			internal.ErrBadRequest, accessKeyOrg.ID, orgFromRequest.ID)
 	default:
 		return orgFromRequest, nil
 	}
 }
 
-func withDBTxn(ctx context.Context, db *gorm.DB, fn func(tx *gorm.DB)) {
-	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		fn(tx)
-		return nil
-	})
-	// TODO: https://github.com/infrahq/infra/issues/2697
-	if err != nil {
-		logging.L.Error().Err(err).Msg("failed to commit database transaction")
-	}
-}
-
-func unauthenticatedMiddleware(srv *Server) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		withDBTxn(c.Request.Context(), srv.DB().GormDB(), func(db *gorm.DB) {
-			tx := data.NewTransaction(db, 0)
-			// ignore errors, access key is not required
-			authned, _ := requireAccessKey(c, tx, srv)
-
-			org, err := validateOrgMatchesRequest(c.Request, tx, authned.Organization)
-			if err != nil {
-				logging.L.Warn().Err(err).Msg("org validation failed")
-				sendAPIError(c, internal.ErrBadRequest)
-				return
-			}
-			authned.Organization = org
-
-			// See this diagram for more details about this request flow
-			// when an org is not specified.
-			// https://github.com/infrahq/infra/blob/main/docs/dev/organization-request-flow.md
-
-			// TODO: use an explicit setting for this, don't overload EnableSignup
-			if org == nil && !srv.options.EnableSignup { // is single tenant
-				org = srv.db.DefaultOrg
-			}
-			if org != nil {
-				authned.Organization = org
-				tx = data.NewTransaction(db, org.ID)
-			}
-
-			rCtx := access.RequestContext{
-				Request:       c.Request,
-				DBTxn:         tx,
-				Authenticated: authned,
-			}
-			c.Set(access.RequestContextKey, rCtx)
-			c.Next()
-		})
-	}
-}
-
-func orgRequired() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		rCtx := getRequestContext(c)
-
-		if rCtx.Authenticated.Organization == nil {
-			sendAPIError(c, internal.ErrBadRequest)
-			return
-		}
-		c.Next()
-	}
-}
-
 // requireAccessKey checks the bearer token is present and valid
-func requireAccessKey(c *gin.Context, db data.GormTxn, srv *Server) (access.Authenticated, error) {
+func requireAccessKey(c *gin.Context, db *data.Transaction, srv *Server) (access.Authenticated, error) {
 	var u access.Authenticated
 
 	bearer, err := reqBearerToken(c, srv.options)
@@ -203,7 +159,7 @@ func requireAccessKey(c *gin.Context, db data.GormTxn, srv *Server) (access.Auth
 		return u, err
 	}
 
-	accessKey, err := data.ValidateAccessKey(db, bearer)
+	accessKey, err := data.ValidateRequestAccessKey(db, bearer)
 	if err != nil {
 		if errors.Is(err, data.ErrAccessKeyExpired) {
 			return u, err
@@ -218,29 +174,42 @@ func requireAccessKey(c *gin.Context, db data.GormTxn, srv *Server) (access.Auth
 		}
 	}
 
-	org, err := data.GetOrganization(db, data.ByID(accessKey.OrganizationID))
+	org, err := data.GetOrganization(db, data.GetOrganizationOptions{ByID: accessKey.OrganizationID})
 	if err != nil {
 		return u, fmt.Errorf("access key org lookup: %w", err)
 	}
 
 	// now that the org is loaded scope all db calls to that org
 	// TODO: set the orgID explicitly in the options passed to GetIdentity to
-	// remove the need for this NewTransaction call.
-	db = data.NewTransaction(db.GormDB(), org.ID)
+	// remove the need for this WithOrgID.
+	db = db.WithOrgID(org.ID)
 
-	identity, err := data.GetIdentity(db, data.ByID(accessKey.IssuedFor))
-	if err != nil {
-		return u, fmt.Errorf("identity for access key: %w", err)
-	}
+	// either this access key was issued for a user or for an identity provider to do SCIM
+	if accessKey.IssuedFor == accessKey.ProviderID {
+		// this access key was issued for SCIM for an identity provider, validate the provider still exists
+		_, err := data.GetProvider(db, data.GetProviderOptions{ByID: accessKey.IssuedFor})
+		if err != nil {
+			return u, fmt.Errorf("provider for access key: %w", err)
+		}
+	} else {
+		// the typical case, this is an access key for a user, validate the user still exists
+		identity, err := data.GetIdentity(db, data.GetIdentityOptions{ByID: accessKey.IssuedFor})
+		if err != nil {
+			return u, fmt.Errorf("identity for access key: %w", err)
+		}
 
-	identity.LastSeenAt = time.Now().UTC()
-	if err = data.SaveIdentity(db, identity); err != nil {
-		return u, fmt.Errorf("identity update fail: %w", err)
+		if time.Since(identity.LastSeenAt) > lastSeenUpdateThreshold {
+			identity.LastSeenAt = time.Now().UTC()
+			if err = data.UpdateIdentity(db, identity); err != nil {
+				return u, fmt.Errorf("identity update fail: %w", err)
+			}
+		}
+
+		u.User = identity
 	}
 
 	u.AccessKey = accessKey
 	u.Organization = org
-	u.User = identity
 	return u, nil
 }
 
@@ -264,7 +233,7 @@ func getRequestContext(c *gin.Context) access.RequestContext {
 	return rCtx
 }
 
-func getOrgFromRequest(req *http.Request, tx data.GormTxn) (*models.Organization, error) {
+func getOrgFromRequest(req *http.Request, tx data.ReadTxn) (*models.Organization, error) {
 	host := req.Host
 
 	logging.Debugf("Host: %s", host)
@@ -273,7 +242,7 @@ func getOrgFromRequest(req *http.Request, tx data.GormTxn) (*models.Organization
 	}
 
 hostLookup:
-	org, err := data.GetOrganization(tx, data.ByDomain(host))
+	org, err := data.GetOrganization(tx, data.GetOrganizationOptions{ByDomain: host})
 	if err != nil {
 		if errors.Is(err, internal.ErrNotFound) {
 			logging.Debugf("Host not found: %s", host)
@@ -325,4 +294,15 @@ func reqBearerToken(c *gin.Context, opts Options) (string, error) {
 	}
 
 	return bearer, nil
+}
+
+// logError calls fn and writes a log line at the warning level if the error is
+// not nil. The log level is a warning because the error is not handled, which
+// generally indicates the problem is not a critical error.
+// logError accepts a function instead of an error so that it can be used with
+// defer.
+func logError(fn func() error, msg string) {
+	if err := fn(); err != nil {
+		logging.L.Warn().Err(err).Msg(msg)
+	}
 }

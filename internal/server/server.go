@@ -11,12 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/gin-gonic/gin"
 	"github.com/infrahq/secrets"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
 
 	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/cmd/types"
@@ -26,22 +25,36 @@ import (
 	"github.com/infrahq/infra/internal/server/data"
 	"github.com/infrahq/infra/internal/server/email"
 	"github.com/infrahq/infra/internal/server/models"
+	"github.com/infrahq/infra/internal/server/redis"
 	"github.com/infrahq/infra/metrics"
 )
 
 type Options struct {
-	Version         float64
-	TLSCache        string // TODO: move this to TLS.CacheDir
+	Version  float64
+	TLSCache string // TODO: move this to TLS.CacheDir
+
 	EnableTelemetry bool
+
 	// EnableSignup indicates that anyone can signup and create an org. When
 	// true this implies multi-tenancy, but false does not necessarily indicate
 	// a single tenancy environment (because orgs could have been created by a
 	// support admin).
-	EnableSignup             bool
-	SessionDuration          time.Duration
-	SessionExtensionDeadline time.Duration
+	EnableSignup bool
 
-	DBFile                  string
+	// EnableLogSampling indicates whether or not to sample HTTP access logs.
+	// When true, non-error HTTP GET logs will sampled down to 1 every 7 seconds
+	// grouped by the request path.
+	EnableLogSampling bool
+
+	SessionDuration          time.Duration // the lifetime of the access key infra issues on login
+	SessionInactivityTimeout time.Duration // access keys issued on login must be used within this window of time, or they become invalid
+
+	// Redis contains configuration options to the cache server.
+	Redis redis.Options
+
+	GoogleClientID     string
+	GoogleClientSecret string
+
 	DBEncryptionKey         string
 	DBEncryptionKeyProvider string
 	DBHost                  string
@@ -70,6 +83,9 @@ type Options struct {
 	Addr ListenerOptions
 	UI   UIOptions
 	TLS  TLSOptions
+	API  APIOptions
+
+	DB data.NewDBOptions
 }
 
 type ListenerOptions struct {
@@ -97,15 +113,22 @@ type TLSOptions struct {
 	ACME bool
 }
 
+type APIOptions struct {
+	RequestTimeout         time.Duration
+	BlockingRequestTimeout time.Duration
+}
+
 type Server struct {
 	options         Options
 	db              *data.DB
+	redis           *redis.Redis
 	tel             *Telemetry
 	secrets         map[string]secrets.SecretStorage
 	keys            map[string]secrets.SymmetricKeyProvider
 	Addrs           Addrs
 	routines        []routine
 	metricsRegistry *prometheus.Registry
+	Google          *models.Provider
 }
 
 type Addrs struct {
@@ -125,6 +148,10 @@ func newServer(options Options) *Server {
 
 // New creates a Server, and initializes it. The returned Server is ready to run.
 func New(options Options) (*Server, error) {
+	if options.EnableSignup && options.BaseDomain == "" {
+		return nil, errors.New("cannot enable signup without setting base domain")
+	}
+
 	server := newServer(options)
 
 	if err := importSecrets(options.Secrets, server.secrets); err != nil {
@@ -135,20 +162,53 @@ func New(options Options) (*Server, error) {
 		return nil, fmt.Errorf("key config: %w", err)
 	}
 
-	driver, err := server.getDatabaseDriver()
+	dsn, err := getPostgresConnectionString(options, server.secrets)
 	if err != nil {
-		return nil, fmt.Errorf("driver: %w", err)
+		return nil, fmt.Errorf("postgres dsn: %w", err)
 	}
+	options.DB.DSN = dsn
 
-	db, err := data.NewDB(driver, server.loadDBKey)
+	dbKeyProvider, ok := server.keys[options.DBEncryptionKeyProvider]
+	if !ok {
+		return nil, fmt.Errorf("key provider %s not configured", options.DBEncryptionKeyProvider)
+	}
+	options.DB.EncryptionKeyProvider = dbKeyProvider
+	options.DB.RootKeyID = options.DBEncryptionKey
+
+	db, err := data.NewDB(options.DB)
 	if err != nil {
 		return nil, fmt.Errorf("db: %w", err)
 	}
 	server.db = db
-	server.metricsRegistry = setupMetrics(server.DB())
+	server.metricsRegistry = setupMetrics(server.db)
+
+	redisPassword, err := secrets.GetSecret(options.Redis.Password, server.secrets)
+	if err != nil {
+		return nil, fmt.Errorf("redis: %w", err)
+	}
+
+	options.Redis.Password = redisPassword
+	redis, err := redis.NewRedis(options.Redis)
+	if err != nil {
+		return nil, err
+	}
+	server.redis = redis
 
 	if options.EnableTelemetry {
-		server.tel = NewTelemetry(server.DB(), db.DefaultOrgSettings.ID)
+		server.tel = NewTelemetry(server.db, db.DefaultOrgSettings.ID)
+	}
+
+	if options.GoogleClientID != "" {
+		server.Google = &models.Provider{
+			Name:         "Google",
+			URL:          "accounts.google.com",
+			ClientID:     options.GoogleClientID,
+			ClientSecret: models.EncryptedAtRest(options.GoogleClientSecret),
+			CreatedBy:    models.CreatedBySystem,
+			Kind:         models.ProviderKindGoogle,
+			AuthURL:      "https://accounts.google.com/o/oauth2/v2/auth",
+			Scopes:       []string{"openid", "email"}, // TODO: update once our social client has groups
+		}
 	}
 
 	if err := server.loadConfig(server.options.Config); err != nil {
@@ -166,18 +226,21 @@ func New(options Options) (*Server, error) {
 
 // DB returns an instance of a database connection pool that is used by the server.
 // It is primarily used by tests to create fixture data.
-func (s *Server) DB() data.GormTxn {
+func (s *Server) DB() *data.DB {
 	return s.db
 }
 
 func (s *Server) Run(ctx context.Context) error {
+	group, ctx := errgroup.WithContext(ctx)
+
+	s.SetupBackgroundJobs(ctx)
+
 	if s.tel != nil {
-		repeat.Start(ctx, 1*time.Hour, func(context.Context) {
-			s.tel.EnqueueHeartbeat()
+		group.Go(func() error {
+			return runTelemetryHeartbeat(ctx, s.tel)
 		})
 	}
 
-	group, _ := errgroup.WithContext(ctx)
 	for i := range s.routines {
 		group.Go(s.routines[i].run)
 	}
@@ -203,23 +266,38 @@ func (s *Server) Run(ctx context.Context) error {
 	return err
 }
 
-func registerUIRoutes(router *gin.Engine, opts UIOptions) {
-	if opts.ProxyURL.Host != "" {
-		remote := opts.ProxyURL.Value()
-		proxy := httputil.NewSingleHostReverseProxy(remote)
-		proxy.Director = func(req *http.Request) {
-			req.Host = remote.Host
-			req.URL.Scheme = remote.Scheme
-			req.URL.Host = remote.Host
+func runTelemetryHeartbeat(ctx context.Context, tel *Telemetry) error {
+	waiter := repeat.NewWaiter(backoff.NewConstantBackOff(time.Hour))
+	for {
+		tel.EnqueueHeartbeat()
+		if err := waiter.Wait(ctx); err != nil {
+			return err
 		}
-		proxy.ErrorLog = log.New(logging.NewFilteredHTTPLogger(), "", 0)
+	}
+}
 
-		router.Use(func(c *gin.Context) {
-			proxy.ServeHTTP(c.Writer, c.Request)
-			c.Abort()
-		})
+func registerUIRoutes(router *gin.Engine, opts UIOptions) {
+	if opts.ProxyURL.Host == "" {
 		return
 	}
+	remote := opts.ProxyURL.Value()
+	proxy := httputil.NewSingleHostReverseProxy(remote)
+	proxy.Director = func(req *http.Request) {
+		req.Host = remote.Host
+		req.URL.Scheme = remote.Scheme
+		req.URL.Host = remote.Host
+	}
+	proxy.ErrorLog = log.New(logging.NewFilteredHTTPLogger(), "", 0)
+
+	router.Use(func(c *gin.Context) {
+		// Don't proxy /api/* paths
+		if strings.HasPrefix(c.Request.URL.Path, "/api/") {
+			c.Next()
+			return
+		}
+		proxy.ServeHTTP(c.Writer, c.Request)
+		c.Abort()
+	})
 }
 
 func (s *Server) listen() error {
@@ -308,107 +386,43 @@ type routine struct {
 	stop func()
 }
 
-func (s *Server) getDatabaseDriver() (gorm.Dialector, error) {
-	pgDSN, err := s.getPostgresConnectionString()
-	if err != nil {
-		return nil, fmt.Errorf("postgres: %w", err)
-	}
-
-	if pgDSN != "" {
-		return postgres.Open(pgDSN), nil
-	}
-
-	return data.NewSQLiteDriver(s.options.DBFile)
-}
-
 // getPostgresConnectionString parses postgres configuration options and returns the connection string
-func (s *Server) getPostgresConnectionString() (string, error) {
+func getPostgresConnectionString(options Options, secretStorage map[string]secrets.SecretStorage) (string, error) {
 	var pgConn strings.Builder
-	pgConn.WriteString(s.options.DBConnectionString)
+	pgConn.WriteString(options.DBConnectionString + " ")
 
-	if s.options.DBHost != "" {
+	if options.DBHost != "" {
 		// config has separate postgres parameters set, combine them into a connection DSN now
-		fmt.Fprintf(&pgConn, "host=%s ", s.options.DBHost)
+		fmt.Fprintf(&pgConn, "host=%s ", options.DBHost)
+	}
 
-		if s.options.DBUsername != "" {
-			fmt.Fprintf(&pgConn, "user=%s ", s.options.DBUsername)
+	if options.DBUsername != "" {
+		fmt.Fprintf(&pgConn, "user=%s ", options.DBUsername)
+	}
 
-			if s.options.DBPassword != "" {
-				pass, err := secrets.GetSecret(s.options.DBPassword, s.secrets)
-				if err != nil {
-					return "", fmt.Errorf("postgres secret: %w", err)
-				}
-
-				fmt.Fprintf(&pgConn, "password=%s ", pass)
-			}
+	if options.DBPassword != "" {
+		pass, err := secrets.GetSecret(options.DBPassword, secretStorage)
+		if err != nil {
+			return "", fmt.Errorf("postgres secret: %w", err)
 		}
 
-		if s.options.DBPort > 0 {
-			fmt.Fprintf(&pgConn, "port=%d ", s.options.DBPort)
-		}
+		fmt.Fprintf(&pgConn, "password=%s ", pass)
+	}
 
-		if s.options.DBName != "" {
-			fmt.Fprintf(&pgConn, "dbname=%s ", s.options.DBName)
-		}
+	if options.DBPort > 0 {
+		fmt.Fprintf(&pgConn, "port=%d ", options.DBPort)
+	}
 
-		if s.options.DBParameters != "" {
-			fmt.Fprint(&pgConn, s.options.DBParameters)
-		}
+	if options.DBName != "" {
+		fmt.Fprintf(&pgConn, "dbname=%s ", options.DBName)
+	}
+
+	// TODO: deprecate DBParameters now that we accept DBConnectionString
+	if options.DBParameters != "" {
+		fmt.Fprint(&pgConn, options.DBParameters)
 	}
 
 	return strings.TrimSpace(pgConn.String()), nil
-}
-
-var dbKeyName = "dbkey"
-
-// load encrypted db key from database
-func (s *Server) loadDBKey(db data.GormTxn) error {
-	provider, ok := s.keys[s.options.DBEncryptionKeyProvider]
-	if !ok {
-		return fmt.Errorf("key provider %s not configured", s.options.DBEncryptionKeyProvider)
-	}
-
-	keyRec, err := data.GetEncryptionKey(db, data.ByName(dbKeyName))
-	if err != nil {
-		if errors.Is(err, internal.ErrNotFound) {
-			return createDBKey(db, provider, s.options.DBEncryptionKey)
-		}
-
-		return err
-	}
-
-	sKey, err := provider.DecryptDataKey(s.options.DBEncryptionKey, keyRec.Encrypted)
-	if err != nil {
-		return err
-	}
-
-	models.SymmetricKey = sKey
-
-	return nil
-}
-
-// creates db key
-func createDBKey(db data.GormTxn, provider secrets.SymmetricKeyProvider, rootKeyId string) error {
-	sKey, err := provider.GenerateDataKey(rootKeyId)
-	if err != nil {
-		return err
-	}
-
-	key := &models.EncryptionKey{
-		Name:      dbKeyName,
-		Encrypted: sKey.Encrypted,
-		Algorithm: sKey.Algorithm,
-		RootKeyID: sKey.RootKeyID,
-	}
-
-	_, err = data.CreateEncryptionKey(db, key)
-	if err != nil {
-		return err
-	}
-
-	models.SymmetricKey = sKey
-
-	return nil
 }
 
 func configureEmail(options Options) {

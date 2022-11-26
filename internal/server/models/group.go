@@ -9,13 +9,11 @@ type Group struct {
 	Model
 	OrganizationMember
 
-	Name              string `gorm:"uniqueIndex:idx_groups_name,where:deleted_at is NULL"`
+	Name              string
 	CreatedBy         uid.ID
 	CreatedByProvider uid.ID
 
-	Identities []Identity `gorm:"many2many:identities_groups"`
-
-	TotalUsers int `gorm:"-:all"`
+	TotalUsers int `db:"-"`
 }
 
 func (g *Group) ToAPI() *api.Group {

@@ -31,13 +31,13 @@ func (a *API) ListUsers(c *gin.Context, r *api.ListUsersRequest) (*api.ListRespo
 
 func (a *API) GetUser(c *gin.Context, r *api.GetUserRequest) (*api.User, error) {
 	if r.ID.IsSelf {
-		iden := access.AuthenticatedIdentity(c)
+		iden := access.GetRequestContext(c).Authenticated.User
 		if iden == nil {
 			return nil, fmt.Errorf("%w: no user is logged in", internal.ErrUnauthorized)
 		}
 		r.ID.ID = iden.ID
 	}
-	identity, err := access.GetIdentity(c, r.ID.ID)
+	identity, err := access.GetIdentity(c, data.GetIdentityOptions{ByID: r.ID.ID, LoadProviders: true})
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +48,6 @@ func (a *API) GetUser(c *gin.Context, r *api.GetUserRequest) (*api.User, error) 
 // CreateUser creates a user with the Infra provider
 func (a *API) CreateUser(c *gin.Context, r *api.CreateUserRequest) (*api.CreateUserResponse, error) {
 	user := &models.Identity{Name: r.Name}
-	infraProvider := access.InfraProvider(c)
 
 	// infra identity creation should be attempted even if an identity is already known
 	identities, err := access.ListIdentities(c, user.Name, 0, nil, false, &data.Pagination{Limit: 2})
@@ -73,20 +72,11 @@ func (a *API) CreateUser(c *gin.Context, r *api.CreateUserRequest) (*api.CreateU
 		Name: user.Name,
 	}
 
-	_, err = access.CreateProviderUser(c, infraProvider, user)
-	if err != nil {
-		return nil, fmt.Errorf("creating provider user: %w", err)
-	}
-
 	// Always create a temporary password for infra users.
 	tmpPassword, err := access.CreateCredential(c, *user)
 	if err != nil {
 		return nil, fmt.Errorf("create credential: %w", err)
 	}
-
-	a.t.User(user.ID.String(), user.Name)
-	a.t.OrgMembership(user.OrganizationID.String(), user.ID.String())
-	a.t.Event("create_user", user.ID.String(), Properties{})
 
 	if email.IsConfigured() {
 		rCtx := access.GetRequestContext(c)
@@ -96,12 +86,12 @@ func (a *API) CreateUser(c *gin.Context, r *api.CreateUserRequest) (*api.CreateU
 		// hack because we don't have names.
 		fromName := email.BuildNameFromEmail(currentUser.Name)
 
-		token, err := access.PasswordResetRequest(c, user.Name, 72*time.Hour)
+		token, user, err := access.PasswordResetRequest(c, user.Name, 72*time.Hour)
 		if err != nil {
 			return nil, err
 		}
 
-		err = email.SendUserInvite("", user.Name, email.UserInviteData{
+		err = email.SendUserInviteEmail("", user.Name, email.UserInviteData{
 			FromUserName: fromName,
 			Link:         fmt.Sprintf("https://%s/accept-invite?token=%s", org.Domain, token),
 		})
@@ -117,19 +107,15 @@ func (a *API) CreateUser(c *gin.Context, r *api.CreateUserRequest) (*api.CreateU
 
 func (a *API) UpdateUser(c *gin.Context, r *api.UpdateUserRequest) (*api.User, error) {
 	// right now this endpoint can only update a user's credentials, so get the user identity
-	identity, err := access.GetIdentity(c, r.ID)
+	identity, err := access.GetIdentity(c, data.GetIdentityOptions{ByID: r.ID, LoadProviders: true})
 	if err != nil {
 		return nil, err
 	}
 
-	err = access.UpdateCredential(c, identity, r.Password)
+	err = access.UpdateCredential(c, identity, r.OldPassword, r.Password)
 	if err != nil {
 		return nil, err
 	}
-
-	// if the user is an admin, we could be required to create the infra user, so create the provider_user if it's missing.
-	_, _ = access.CreateProviderUser(c, access.InfraProvider(c), identity)
-
 	return identity.ToAPI(), nil
 }
 

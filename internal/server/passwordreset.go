@@ -11,12 +11,15 @@ import (
 	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/access"
 	"github.com/infrahq/infra/internal/server/email"
+	"github.com/infrahq/infra/internal/server/redis"
 )
 
 func (a *API) RequestPasswordReset(c *gin.Context, r *api.PasswordResetRequest) (*api.EmptyResponse, error) {
-	// TODO: rate-limit
+	if err := redis.NewLimiter(a.server.redis).RateOK(r.Email, 10); err != nil {
+		return nil, err
+	}
 
-	token, err := access.PasswordResetRequest(c, r.Email, 15*time.Minute)
+	token, user, err := access.PasswordResetRequest(c, r.Email, 15*time.Minute)
 	if err != nil {
 		if errors.Is(err, internal.ErrNotFound) {
 			return nil, nil // This is okay. we don't notify the user if we failed to find the email.
@@ -27,8 +30,8 @@ func (a *API) RequestPasswordReset(c *gin.Context, r *api.PasswordResetRequest) 
 	org := access.GetRequestContext(c).Authenticated.Organization
 
 	// send email
-	err = email.SendPasswordReset("", r.Email, email.PasswordResetData{
-		Link: fmt.Sprintf("https://%s/password-reset?token=%s", org.Domain, token),
+	err = email.SendPasswordResetEmail("", r.Email, email.PasswordResetData{
+		Link: wrapLinkWithVerification(fmt.Sprintf("https://%s/password-reset?token=%s", org.Domain, token), org.Domain, user.VerificationToken),
 	})
 	if err != nil {
 		return nil, err

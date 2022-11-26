@@ -11,68 +11,15 @@ import (
 	"github.com/infrahq/infra/uid"
 )
 
-// TODO: replace calls to this function with GetRequestContext once the
-// data interface has stabilized.
-func getDB(c *gin.Context) data.GormTxn {
-	return GetRequestContext(c).DBTxn
-}
-
-// hasAuthorization checks if a caller is the owner of a resource before checking if they have an approprite role to access it
-func hasAuthorization(c *gin.Context, requestedResource uid.ID, isResourceOwner func(c *gin.Context, requestedResourceID uid.ID) (bool, error), oneOfRoles ...string) (data.GormTxn, error) {
-	owner, err := isResourceOwner(c, requestedResource)
-	if err != nil {
-		return nil, fmt.Errorf("owner lookup: %w", err)
-	}
-
-	if owner {
-		return getDB(c), nil
-	}
-
-	return RequireInfraRole(c, oneOfRoles...)
-}
-
 const ResourceInfraAPI = "infra"
 
 // RequireInfraRole checks that the identity in the context can perform an action on a resource based on their granted roles
-func RequireInfraRole(c *gin.Context, oneOfRoles ...string) (data.GormTxn, error) {
-	db := getDB(c)
-
-	identity := AuthenticatedIdentity(c)
-	if identity == nil {
-		return nil, fmt.Errorf("no active identity")
+func RequireInfraRole(c *gin.Context, oneOfRoles ...string) (*data.Transaction, error) {
+	rCtx := GetRequestContext(c)
+	if err := IsAuthorized(rCtx, oneOfRoles...); err != nil {
+		return nil, err
 	}
-
-	for _, role := range oneOfRoles {
-		ok, err := Can(db, identity.PolyID(), role, ResourceInfraAPI)
-		if err != nil {
-			return nil, err
-		}
-
-		if ok {
-			return db, nil
-		}
-	}
-
-	// check if they belong to a group that is authorized
-	groups, err := data.ListGroups(db, nil, data.ByGroupMember(identity.ID))
-	if err != nil {
-		return nil, fmt.Errorf("auth user groups: %w", err)
-	}
-
-	for _, group := range groups {
-		for _, role := range oneOfRoles {
-			ok, err := Can(db, group.PolyID(), role, ResourceInfraAPI)
-			if err != nil {
-				return nil, err
-			}
-
-			if ok {
-				return db, nil
-			}
-		}
-	}
-
-	return nil, ErrNotAuthorized
+	return rCtx.DBTxn, nil
 }
 
 var ErrNotAuthorized = errors.New("not authorized")
@@ -121,12 +68,27 @@ func HandleAuthErr(err error, resource, operation string, roles ...string) error
 	}
 }
 
-// Can checks if an identity has a privilege that means it can perform an action on a resource
-func Can(db data.GormTxn, identity uid.PolymorphicID, privilege, resource string) (bool, error) {
-	grants, err := data.ListGrants(db, &data.Pagination{Limit: 1}, data.BySubject(identity), data.ByPrivilege(privilege), data.ByResource(resource))
-	if err != nil {
-		return false, fmt.Errorf("has grants: %w", err)
+// IsAuthorized checks if the request has permission to perform the action. The
+// request has permission if the user or one of the groups they belong to
+// has a grant with one of the required roles.
+// The resource is always ResourceInfraAPI.
+func IsAuthorized(rCtx RequestContext, requiredRole ...string) error {
+	user := rCtx.Authenticated.User
+	if user == nil {
+		return fmt.Errorf("no authenticated user")
 	}
-
-	return len(grants) > 0, nil
+	grants, err := data.ListGrants(rCtx.DBTxn, data.ListGrantsOptions{
+		Pagination:                 &data.Pagination{Limit: 1},
+		BySubject:                  uid.NewIdentityPolymorphicID(user.ID),
+		ByPrivileges:               requiredRole,
+		ByResource:                 ResourceInfraAPI,
+		IncludeInheritedFromGroups: true,
+	})
+	if err != nil {
+		return fmt.Errorf("has grants: %w", err)
+	}
+	if len(grants) == 0 {
+		return ErrNotAuthorized
+	}
+	return nil
 }

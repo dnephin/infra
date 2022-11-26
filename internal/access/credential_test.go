@@ -21,12 +21,12 @@ func TestSettingsPasswordRequirements(t *testing.T) {
 	_, err = CreateCredential(c, *user)
 	assert.NilError(t, err)
 
-	err = data.SaveSettings(db, &models.Settings{
+	err = data.UpdateSettings(db, &models.Settings{
 		LengthMin: 8,
 	})
 	assert.NilError(t, err)
 	t.Run("Update user credentials fails if less than min length", func(t *testing.T) {
-		err := UpdateCredential(c, user, "short")
+		err := UpdateCredential(c, user, "", "short")
 		assert.ErrorContains(t, err, "validation failed: password")
 		assert.ErrorContains(t, err, "needs minimum length of 8")
 	})
@@ -35,24 +35,24 @@ func TestSettingsPasswordRequirements(t *testing.T) {
 	settings, err := data.GetSettings(db)
 	assert.NilError(t, err)
 	settings.LengthMin = 5
-	err = data.SaveSettings(db, settings)
+	err = data.UpdateSettings(db, settings)
 	assert.NilError(t, err)
 	t.Run("Update user credentials passes if equal than min length", func(t *testing.T) {
-		err := UpdateCredential(c, user, "short")
+		err := UpdateCredential(c, user, "", "short")
 		assert.NilError(t, err)
 	})
 	t.Run("Update user credentials passes if equal than min length", func(t *testing.T) {
-		err := UpdateCredential(c, user, "longer")
+		err := UpdateCredential(c, user, "", "longer")
 		assert.NilError(t, err)
 	})
 
 	// Test multiple failures
 	settings.LengthMin = 10
 	settings.SymbolMin = 1
-	err = data.SaveSettings(db, settings)
+	err = data.UpdateSettings(db, settings)
 	assert.NilError(t, err)
 	t.Run("Update user credentials fails with multiple requirement failures", func(t *testing.T) {
-		err := UpdateCredential(c, user, "badpw")
+		err := UpdateCredential(c, user, "", "badpw")
 		assert.ErrorContains(t, err, "validation failed: password:")
 		assert.ErrorContains(t, err, "needs minimum 1 symbols")
 		assert.ErrorContains(t, err, "needs minimum length of 10")
@@ -71,7 +71,7 @@ func TestCreateCredential(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Assert(t, oneTimePassword != "")
 
-	_, err = data.GetCredential(db, data.ByIdentityID(user.ID))
+	_, err = data.GetCredentialByUserID(db, user.ID)
 	assert.NilError(t, err)
 }
 
@@ -80,30 +80,74 @@ func TestUpdateCredentials(t *testing.T) {
 
 	username := "bruce@example.com"
 	user := &models.Identity{Name: username}
+
 	err := data.CreateIdentity(db, user)
 	assert.NilError(t, err)
 
-	_, err = CreateCredential(c, *user)
+	tmpPassword, err := CreateCredential(c, *user)
+	assert.NilError(t, err)
+
+	userCreds, err := data.GetCredentialByUserID(db, user.ID)
 	assert.NilError(t, err)
 
 	t.Run("Update user credentials IS single use password", func(t *testing.T) {
-		err := UpdateCredential(c, user, "newPassword")
+		err := UpdateCredential(c, user, "", "newPassword")
 		assert.NilError(t, err)
 
-		creds, err := data.GetCredential(db, data.ByIdentityID(user.ID))
+		creds, err := data.GetCredentialByUserID(db, user.ID)
 		assert.NilError(t, err)
 		assert.Equal(t, creds.OneTimePassword, true)
 	})
 
 	t.Run("Update own credentials is NOT single use password", func(t *testing.T) {
-		c.Set("identity", user)
-
-		err := UpdateCredential(c, user, "newPassword")
+		err := data.UpdateCredential(db, userCreds)
 		assert.NilError(t, err)
 
-		creds, err := data.GetCredential(db, data.ByIdentityID(user.ID))
+		rCtx := GetRequestContext(c)
+		rCtx.Authenticated.User = user
+		c.Set(RequestContextKey, rCtx)
+
+		err = UpdateCredential(c, user, tmpPassword, "newPassword")
+		assert.NilError(t, err)
+
+		creds, err := data.GetCredentialByUserID(db, user.ID)
 		assert.NilError(t, err)
 		assert.Equal(t, creds.OneTimePassword, false)
+	})
+
+	t.Run("Update own credentials removes password reset scope, but keeps other scopes", func(t *testing.T) {
+		err := data.UpdateCredential(db, userCreds)
+		assert.NilError(t, err)
+
+		rCtx := GetRequestContext(c)
+		rCtx.Authenticated.User = user
+
+		key := &models.AccessKey{
+			IssuedFor:  user.ID,
+			ProviderID: data.InfraProvider(db).ID,
+			Scopes:     []string{models.ScopeAllowCreateAccessKey, models.ScopePasswordReset},
+		}
+		_, err = CreateAccessKey(c, key)
+		assert.NilError(t, err)
+		rCtx.Authenticated.AccessKey = key
+		c.Set(RequestContextKey, rCtx)
+
+		err = UpdateCredential(c, user, "", "newPassword")
+		assert.ErrorContains(t, err, "oldPassword: is required")
+
+		err = UpdateCredential(c, user, "somePassword", "newPassword")
+		assert.ErrorContains(t, err, "oldPassword: invalid oldPassword")
+
+		err = UpdateCredential(c, user, tmpPassword, "newPassword")
+		assert.NilError(t, err)
+
+		creds, err := data.GetCredentialByUserID(db, user.ID)
+		assert.NilError(t, err)
+		assert.Equal(t, creds.OneTimePassword, false)
+
+		updatedKey, err := data.GetAccessKeyByKeyID(db, key.KeyID)
+		assert.NilError(t, err)
+		assert.DeepEqual(t, updatedKey.Scopes, models.CommaSeparatedStrings{models.ScopeAllowCreateAccessKey})
 	})
 }
 

@@ -37,31 +37,39 @@ var funcPartialNameToTagNames = []struct {
 	{partial: "AccessKey", tag: "Authentication"},
 	{partial: "Login", tag: "Authentication"},
 	{partial: "Logout", tag: "Authentication"},
+	{partial: "Device", tag: "Authentication"},
+	{partial: "Password", tag: "Authentication"},
 	{partial: "Destination", tag: "Destinations"},
 	{partial: "Token", tag: "Destinations"},
 	{partial: "Grant", tag: "Grants"},
 	{partial: "Group", tag: "Groups"},
 	{partial: "Provider", tag: "Providers"},
 	{partial: "User", tag: "Users"},
+	{partial: "Settings", tag: "Settings"},
+	{partial: "Configuration", tag: "Settings"},
+	{partial: "Version", tag: "Settings"},
+	{partial: "Organization", tag: "Organizations"},
+	{partial: "Domain", tag: "Organizations"},
 }
 
 // openAPIRouteDefinition converts the route into a format that can be used
 // by API.register. This is necessary because currently methods can not have
 // generic parameters.
-func openAPIRouteDefinition[Req, Res any](route route[Req, Res]) (
+func openAPIRouteDefinition[Req, Res any](routeID routeIdentifier, route route[Req, Res]) (
 	method string,
 	path string,
 	funcName string,
 	requestType reflect.Type,
 	resultType reflect.Type,
+	requiresAuthentication bool,
 ) {
 	//nolint:gocritic
 	reqT, resultT := reflect.TypeOf(*new(Req)), reflect.TypeOf(*new(Res))
-	return route.method, route.path, getFuncName(route.handler), reqT, resultT
+	return routeID.method, routeID.path, getFuncName(route.handler), reqT, resultT, !route.authenticationOptional
 }
 
 // register adds the route to the API.OpenAPIDocument.
-func (a *API) register(method, path, funcName string, rqt, rst reflect.Type) {
+func (a *API) register(method, path, funcName string, rqt, rst reflect.Type, requiresAuthentication bool) {
 	path = pathIDReplacer.ReplaceAllStringFunc(path, func(s string) string {
 		return "{" + strings.TrimLeft(s, ":") + "}"
 	})
@@ -83,7 +91,7 @@ func (a *API) register(method, path, funcName string, rqt, rst reflect.Type) {
 	op.OperationID = funcName
 	op.Description = funcName
 	op.Summary = funcName
-	buildRequest(rqt, op, method)
+	buildRequest(rqt, op, method, requiresAuthentication)
 	op.Responses = buildResponse(a.openAPIDoc.Components.Schemas, rst)
 
 	for _, item := range funcPartialNameToTagNames {
@@ -181,8 +189,8 @@ func buildProperty(f reflect.StructField, t, parent reflect.Type, parentSchema *
 	}
 
 	s := &openapi3.Schema{}
-	updateSchemaFromStructTags(f, s)
 	setTypeInfo(t, s)
+	updateSchemaFromStructTags(f, s)
 
 	if s.Type == "array" {
 		s.Items = buildProperty(f, t.Elem(), parent, parentSchema)
@@ -373,7 +381,7 @@ func buildResponse(schemas openapi3.Schemas, rst reflect.Type) openapi3.Response
 // so that tests expect a consistent value that does not change with every release.
 var productVersion = internal.FullVersion
 
-func buildRequest(r reflect.Type, op *openapi3.Operation, method string) {
+func buildRequest(r reflect.Type, op *openapi3.Operation, method string, requiresAuthentication bool) {
 	if r.Kind() == reflect.Pointer {
 		r = r.Elem()
 	}
@@ -398,6 +406,22 @@ func buildRequest(r reflect.Type, op *openapi3.Operation, method string) {
 		},
 	})
 
+	if requiresAuthentication {
+		op.AddParameter(&openapi3.Parameter{
+			Name:     "Authorization",
+			In:       "header",
+			Required: true,
+			Schema: &openapi3.SchemaRef{
+				Value: &openapi3.Schema{
+					Example:     "Bearer ACCESSKEY",
+					Format:      `Bearer [\da-zA-Z]{10}\.[\da-zA-Z]{24}`,
+					Type:        "string",
+					Description: "Bearer followed by your access key",
+				},
+			},
+		})
+	}
+
 	schema := &openapi3.Schema{
 		Type:       "object",
 		Properties: openapi3.Schemas{},
@@ -408,9 +432,9 @@ func buildRequest(r reflect.Type, op *openapi3.Operation, method string) {
 		if f.Type.Kind() == reflect.Struct && f.Anonymous {
 			tmpOp := openapi3.NewOperation()
 
-			buildRequest(f.Type, tmpOp, method)
+			buildRequest(f.Type, tmpOp, method, false)
 			for _, param := range tmpOp.Parameters {
-				if param.Value.Name != "Infra-Version" {
+				if param.Value.Name != "Infra-Version" && param.Value.Name != "Authorization" {
 					op.AddParameter(param.Value)
 				}
 			}

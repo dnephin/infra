@@ -6,23 +6,19 @@ import (
 
 	"github.com/infrahq/infra/internal/logging"
 	"github.com/infrahq/infra/internal/server/data"
-	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/metrics"
 )
 
-func setupMetrics(db data.GormTxn) *prometheus.Registry {
+func setupMetrics(db *data.DB) *prometheus.Registry {
 	registry := metrics.NewRegistry(productVersion())
-
-	if sqlDB, err := db.GormDB().DB(); err == nil {
-		registry.MustRegister(collectors.NewDBStatsCollector(sqlDB, db.DriverName()))
-	}
+	registry.MustRegister(collectors.NewDBStatsCollector(db.SQLdb(), "postgres"))
 
 	registry.MustRegister(metrics.NewCollector(prometheus.Opts{
 		Namespace: "infra",
 		Name:      "users",
 		Help:      "The total number of users",
 	}, []string{}, func() []metrics.Metric {
-		count, err := data.GlobalCount[models.Identity](db, data.NotName("connector"))
+		count, err := data.CountAllIdentities(db)
 		if err != nil {
 			logging.L.Warn().Err(err).Msg("users")
 			return []metrics.Metric{}
@@ -38,7 +34,7 @@ func setupMetrics(db data.GormTxn) *prometheus.Registry {
 		Name:      "groups",
 		Help:      "The total number of groups",
 	}, []string{}, func() []metrics.Metric {
-		count, err := data.GlobalCount[models.Group](db)
+		count, err := data.CountAllGroups(db)
 		if err != nil {
 			logging.L.Warn().Err(err).Msg("groups")
 			return []metrics.Metric{}
@@ -54,7 +50,7 @@ func setupMetrics(db data.GormTxn) *prometheus.Registry {
 		Name:      "grants",
 		Help:      "The total number of grants",
 	}, []string{}, func() []metrics.Metric {
-		count, err := data.GlobalCount[models.Grant](db, data.NotPrivilege("connector"))
+		count, err := data.CountAllGrants(db)
 		if err != nil {
 			logging.L.Warn().Err(err).Msg("grants")
 			return []metrics.Metric{}
@@ -78,7 +74,10 @@ func setupMetrics(db data.GormTxn) *prometheus.Registry {
 
 		values := make([]metrics.Metric, 0, len(results))
 		for _, result := range results {
-			values = append(values, metrics.Metric{Count: float64(result.Count), LabelValues: []string{result.Kind}})
+			values = append(values, metrics.Metric{
+				Count:       result.Count,
+				LabelValues: []string{result.Kind},
+			})
 		}
 
 		return values
@@ -113,7 +112,7 @@ func setupMetrics(db data.GormTxn) *prometheus.Registry {
 		Name:      "organizations",
 		Help:      "The total number of organizations",
 	}, []string{}, func() []metrics.Metric {
-		count, err := data.GlobalCount[models.Organization](db)
+		count, err := data.CountOrganizations(db)
 		if err != nil {
 			logging.L.Warn().Err(err).Msg("organizations")
 			return []metrics.Metric{}

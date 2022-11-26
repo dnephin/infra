@@ -2,6 +2,9 @@ package api
 
 import (
 	"bytes"
+	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,7 +14,7 @@ import (
 	"github.com/infrahq/infra/uid"
 )
 
-type Query map[string][]string
+type Query url.Values
 
 type Resource struct {
 	ID uid.ID `uri:"id"`
@@ -43,7 +46,7 @@ func (i *IDOrSelf) UnmarshalText(b []byte) error {
 func (i IDOrSelf) DescribeSchema(schema *openapi3.Schema) {
 	schema.Type = "string"
 	schema.Format = "uid|self"
-	schema.Pattern = `[\da-zA-HJ-NP-Z]{1,11}|self`
+	schema.Pattern = `[1-9a-km-zA-HJ-NP-Z]{1,11}|self`
 	schema.Example = "4yJ3n3D8E2"
 	schema.Description = "a uid or the literal self"
 }
@@ -130,8 +133,12 @@ func (d Duration) DescribeSchema(schema *openapi3.Schema) {
 
 type ListResponse[T any] struct {
 	PaginationResponse `json:",inline"`
-	Count              int `json:"count"`
+	Count              int `json:"count" note:"Total number of items on the current page" example:"100"`
 	Items              []T `json:"items"`
+
+	// LastUpdateIndex is set to the latest update index for any request made
+	// with the updateIndex query parameter.
+	LastUpdateIndex `json:"-"`
 }
 
 func NewListResponse[T, M any](items []M, pr PaginationResponse, fn func(item M) T) *ListResponse[T] {
@@ -146,6 +153,34 @@ func NewListResponse[T, M any](items []M, pr PaginationResponse, fn func(item M)
 	}
 
 	return result
+}
+
+type LastUpdateIndex struct {
+	Index int64 `json:"-"`
+}
+
+func (l *LastUpdateIndex) setValuesFromHeader(header http.Header) error {
+	if idx := header.Get("Last-Update-Index"); idx != "" {
+		var err error
+		l.Index, err = strconv.ParseInt(idx, 10, 64)
+		return err
+	}
+	return nil
+}
+
+// BlockingRequest is used to identify the last update index that was
+// visible to the client. The API endpoint will block until there is a
+// new updated index for the query.
+// BlockingRequests use a longer request timeout than a standard request.
+//
+// Important: metrics.Middleware relies on the name lastUpdateIndex. If that
+// changes the middleware will need to be updated as well.
+type BlockingRequest struct {
+	LastUpdateIndex int64 `form:"lastUpdateIndex" note:"set this to the value of the Last-Update-Index response header to block until the list results have changed"`
+}
+
+func (r BlockingRequest) IsBlockingRequest() bool {
+	return r.LastUpdateIndex != 0
 }
 
 // PEM is a base64 encoded string, commonly used to store certificates and

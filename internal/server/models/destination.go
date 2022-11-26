@@ -6,12 +6,19 @@ import (
 	"github.com/infrahq/infra/api"
 )
 
+type DestinationKind string
+
+const (
+	DestinationKindKubernetes DestinationKind = "kubernetes"
+	DestinationKindSSH        DestinationKind = "ssh"
+)
+
 type Destination struct {
 	Model
 	OrganizationMember
 
 	Name          string
-	UniqueID      string `gorm:"uniqueIndex:idx_destinations_unique_id,where:deleted_at is NULL"`
+	UniqueID      string
 	ConnectionURL string
 	ConnectionCA  string
 
@@ -20,13 +27,12 @@ type Destination struct {
 
 	Resources CommaSeparatedStrings
 	Roles     CommaSeparatedStrings
+	Kind      DestinationKind
 }
 
 func (d *Destination) ToAPI() *api.Destination {
 	connected := false
-	// TODO: this should be configurable
-	// https://github.com/infrahq/infra/issues/2505
-	if time.Since(d.LastSeenAt) < 5*time.Minute {
+	if time.Since(d.LastSeenAt) < 6*time.Minute {
 		connected = true
 	}
 
@@ -35,6 +41,7 @@ func (d *Destination) ToAPI() *api.Destination {
 		Created:  api.Time(d.CreatedAt),
 		Updated:  api.Time(d.UpdatedAt),
 		Name:     d.Name,
+		Kind:     string(d.Kind),
 		UniqueID: d.UniqueID,
 		Connection: api.DestinationConnection{
 			URL: d.ConnectionURL,

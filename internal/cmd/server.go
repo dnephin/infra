@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -12,6 +13,8 @@ import (
 	"github.com/infrahq/infra/internal/cmd/types"
 	"github.com/infrahq/infra/internal/logging"
 	"github.com/infrahq/infra/internal/server"
+	"github.com/infrahq/infra/internal/server/data"
+	"github.com/infrahq/infra/internal/server/redis"
 )
 
 func newServerCmd() *cobra.Command {
@@ -46,13 +49,6 @@ func newServerCmd() *cobra.Command {
 
 			options.TLSCache = tlsCache
 
-			dbFile, err := canonicalPath(options.DBFile)
-			if err != nil {
-				return err
-			}
-
-			options.DBFile = dbFile
-
 			dbEncryptionKey, err := canonicalPath(options.DBEncryptionKey)
 			if err != nil {
 				return err
@@ -70,7 +66,6 @@ func newServerCmd() *cobra.Command {
 
 	cmd.Flags().StringVarP(&configFilename, "config-file", "f", "", "Server configuration file")
 	cmd.Flags().String("tls-cache", "", "Directory to cache TLS certificates")
-	cmd.Flags().String("db-file", "", "Path to SQLite 3 database")
 	cmd.Flags().String("db-name", "", "Database name")
 	cmd.Flags().String("db-host", "", "Database host")
 	cmd.Flags().Int("db-port", 0, "Database port")
@@ -82,30 +77,47 @@ func newServerCmd() *cobra.Command {
 	cmd.Flags().Bool("enable-telemetry", false, "Enable telemetry")
 	cmd.Flags().Var(&types.URL{}, "ui-proxy-url", "Enable UI and proxy requests to this url")
 	cmd.Flags().Duration("session-duration", 0, "Maximum session duration per user login")
-	cmd.Flags().Duration("session-extension-deadline", 0, "A user must interact with Infra at least once within this amount of time for their session to remain valid")
+	cmd.Flags().Duration("session-inactivity-timeout", 0, "A user must interact with Infra at least once within this amount of time for their session to remain valid")
 	cmd.Flags().Bool("enable-signup", false, "Enable one-time admin signup")
 	cmd.Flags().String("base-domain", "", "base-domain for the server, eg example.com")
+	cmd.Flags().String("google-client-id", "", "Client ID of the Google client used for social login")
+	cmd.Flags().String("google-client-secret", "", "Client secret of the Google client used for social login")
 
 	return cmd
 }
 
 func defaultServerOptions(infraDir string) server.Options {
 	return server.Options{
-		Version:                  0.2, // update this as the config version changes
+		Version:                  0.3, // update this as the config version changes
 		TLSCache:                 filepath.Join(infraDir, "cache"),
-		DBFile:                   filepath.Join(infraDir, "sqlite3.db"),
 		DBEncryptionKey:          filepath.Join(infraDir, "sqlite3.db.key"),
 		DBEncryptionKeyProvider:  "native",
 		EnableTelemetry:          true,
 		SessionDuration:          24 * time.Hour * 30, // 30 days
-		SessionExtensionDeadline: 24 * time.Hour * 3,  // 3 days
+		SessionInactivityTimeout: 24 * time.Hour * 3,  // 3 days
 		EnableSignup:             false,
-		BaseDomain:               "example.com",
+		BaseDomain:               "",
+		EnableLogSampling:        true,
 
 		Addr: server.ListenerOptions{
 			HTTP:    ":80",
 			HTTPS:   ":443",
 			Metrics: ":9090",
+		},
+
+		DB: data.NewDBOptions{
+			MaxOpenConnections: 100,
+			MaxIdleConnections: 100,
+			MaxIdleTimeout:     5 * time.Minute,
+		},
+
+		Redis: redis.Options{
+			Port: 6379,
+		},
+
+		API: server.APIOptions{
+			RequestTimeout:         time.Minute,
+			BlockingRequestTimeout: 5 * time.Minute,
 		},
 	}
 }
@@ -117,3 +129,17 @@ var runServer = func(ctx context.Context, srv *server.Server) error {
 
 // newServer is a shim for testing.
 var newServer = server.New
+
+func canonicalPath(path string) (string, error) {
+	path = os.ExpandEnv(path)
+
+	if strings.HasPrefix(path, "~/") {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		path = strings.Replace(path, "~", homeDir, 1)
+	}
+
+	return filepath.Abs(path)
+}

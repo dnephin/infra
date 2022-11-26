@@ -20,8 +20,8 @@ func NewKeyExchangeAuthentication(requestingAccessKey string) LoginMethod {
 	}
 }
 
-func (a *keyExchangeAuthn) Authenticate(_ context.Context, db data.GormTxn, requestedExpiry time.Time) (AuthenticatedIdentity, error) {
-	validatedRequestKey, err := data.ValidateAccessKey(db, a.RequestingAccessKey)
+func (a *keyExchangeAuthn) Authenticate(_ context.Context, db *data.Transaction, requestedExpiry time.Time) (AuthenticatedIdentity, error) {
+	validatedRequestKey, err := data.ValidateRequestAccessKey(db, a.RequestingAccessKey)
 	if err != nil {
 		return AuthenticatedIdentity{}, fmt.Errorf("invalid access key in exchange: %w", err)
 	}
@@ -33,7 +33,7 @@ func (a *keyExchangeAuthn) Authenticate(_ context.Context, db data.GormTxn, requ
 		sessionExpiry = validatedRequestKey.ExpiresAt
 	}
 
-	identity, err := data.GetIdentity(db, data.ByID(validatedRequestKey.IssuedFor))
+	identity, err := data.GetIdentity(db, data.GetIdentityOptions{ByID: validatedRequestKey.IssuedFor})
 	if err != nil {
 		return AuthenticatedIdentity{}, fmt.Errorf("user is not valid: %w", err) // the user was probably deleted
 	}

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"text/tabwriter"
@@ -13,10 +14,10 @@ import (
 
 func newVersionCmd(cli *CLI) *cobra.Command {
 	return &cobra.Command{
-		Use:   "version",
-		Short: "Display the Infra version",
-		Group: "Other commands:",
-		Args:  NoArgs,
+		Use:     "version",
+		Short:   "Display the Infra version",
+		GroupID: groupOther,
+		Args:    NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return version(cli)
 		},
@@ -24,6 +25,8 @@ func newVersionCmd(cli *CLI) *cobra.Command {
 }
 
 func version(cli *CLI) error {
+	ctx := context.Background()
+
 	w := tabwriter.NewWriter(cli.Stdout, 0, 0, 1, ' ', tabwriter.AlignRight)
 	defer w.Flush()
 
@@ -40,7 +43,18 @@ func version(cli *CLI) error {
 		return nil
 	}
 
-	version, err := client.GetServerVersion()
+	config, err := currentHostConfig()
+	if err != nil {
+		return err
+	}
+
+	// Don't bother printing the server version for SaaS
+	if strings.HasSuffix(config.Host, ".infrahq.com") {
+		fmt.Fprintln(w)
+		return nil
+	}
+
+	version, err := client.GetServerVersion(ctx)
 	if err != nil {
 		fmt.Fprintln(w, "Server:\t", "disconnected")
 		logging.Debugf("%s", err.Error())

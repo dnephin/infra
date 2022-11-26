@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
-	"strings"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -15,6 +15,7 @@ import (
 	"github.com/infrahq/infra/internal/access"
 	"github.com/infrahq/infra/internal/logging"
 	"github.com/infrahq/infra/internal/server/data"
+	"github.com/infrahq/infra/internal/server/redis"
 	"github.com/infrahq/infra/internal/validate"
 )
 
@@ -30,10 +31,16 @@ func sendAPIError(c *gin.Context, err error) {
 	var validationError validate.Error
 	var uniqueConstraintError data.UniqueConstraintError
 	var authzError access.AuthorizationError
+	var overLimitError redis.OverLimitError
+	var apiError api.Error
 
 	log := logging.L.Debug()
 
 	switch {
+	case errors.As(err, &apiError):
+		// the handler has already created an appropriate error to return
+		resp = &apiError
+
 	case errors.Is(err, internal.ErrUnauthorized):
 		resp.Code = http.StatusUnauthorized
 		// hide the error text, it may contain sensitive information
@@ -51,18 +58,7 @@ func sendAPIError(c *gin.Context, err error) {
 		resp.Message = authzError.Error()
 
 	case errors.As(err, &uniqueConstraintError):
-		resp.Code = http.StatusConflict
-		resp.Message = err.Error()
-		// remove the error trace from field error message
-		errMsg := err.Error()
-		errTrace := strings.Split(err.Error(), ":")
-		if len(errTrace) > 0 {
-			errMsg = errTrace[len(errTrace)-1]
-		}
-		resp.FieldErrors = append(resp.FieldErrors, api.FieldError{
-			FieldName: uniqueConstraintError.Column,
-			Errors:    []string{errMsg},
-		})
+		*resp = newAPIErrorForUniqueConstraintError(uniqueConstraintError, err.Error())
 
 	case errors.Is(err, internal.ErrNotFound):
 		resp.Code = http.StatusNotFound
@@ -93,13 +89,27 @@ func sendAPIError(c *gin.Context, err error) {
 		resp.Code = http.StatusNotImplemented
 		resp.Message = internal.ErrNotImplemented.Error()
 
+	case errors.Is(err, internal.ErrNotModified):
+		resp.Code = http.StatusNotModified
+		resp.Message = err.Error()
+
 	case errors.Is(err, internal.ErrBadGateway):
 		resp.Code = http.StatusBadGateway
+		resp.Message = err.Error()
+
+	case errors.As(err, &overLimitError):
+		c.Writer.Header().Set("Retry-After", strconv.Itoa(int(overLimitError.RetryAfter.Seconds())))
+		resp.Code = http.StatusTooManyRequests
 		resp.Message = err.Error()
 
 	case errors.Is(err, context.DeadlineExceeded):
 		resp.Code = http.StatusGatewayTimeout // not ideal, but StatusRequestTimeout isn't intended for this.
 		resp.Message = "request timed out"
+
+	case errors.Is(err, context.Canceled):
+		// Nginx uses this non-standard error code for the same purpose
+		resp.Code = 499
+		resp.Message = fmt.Sprintf("client closed the request: %v", err)
 
 	default:
 		log = logging.L.Error()
@@ -115,4 +125,16 @@ func sendAPIError(c *gin.Context, err error) {
 
 	c.JSON(int(resp.Code), resp)
 	c.Abort()
+}
+
+func newAPIErrorForUniqueConstraintError(ucErr data.UniqueConstraintError, msg string) api.Error {
+	apiError := api.Error{
+		Code:    http.StatusConflict,
+		Message: msg,
+	}
+	apiError.FieldErrors = []api.FieldError{{
+		FieldName: ucErr.Column,
+		Errors:    []string{ucErr.Error()},
+	}}
+	return apiError
 }

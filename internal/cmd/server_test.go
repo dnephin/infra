@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"reflect"
@@ -11,10 +12,14 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"gotest.tools/v3/assert"
+	"gotest.tools/v3/env"
 	"gotest.tools/v3/fs"
 
 	"github.com/infrahq/infra/internal/cmd/types"
 	"github.com/infrahq/infra/internal/server"
+	"github.com/infrahq/infra/internal/server/data"
+	"github.com/infrahq/infra/internal/server/redis"
+	"github.com/infrahq/infra/internal/testing/database"
 )
 
 func TestServerCmd_LoadOptions(t *testing.T) {
@@ -119,14 +124,14 @@ func TestServerCmd_LoadOptions(t *testing.T) {
 			name: "all options from config",
 			setup: func(t *testing.T, cmd *cobra.Command) {
 				content := `
-version: 0.2
+version: 0.3
 tlsCache: /cache/dir
 enableTelemetry: false # default is true
 enableSignup: false    # default is true
+enableLogSampling: false # default is true
 sessionDuration: 3m
-sessionExtensionDeadline: 1m
+sessionInactivityTimeout: 1m
 
-dbFile: /db/file
 dbEncryptionKey: /this-is-the-path
 dbEncryptionKeyProvider: the-provider
 dbHost: the-host
@@ -184,6 +189,16 @@ users:
   - name: username
     accessKey: access-key
     password: the-password
+
+redis:
+  host: myredis
+  username: myuser
+  password: mypassword
+
+api:
+  requestTimeout: 2m
+  blockingRequestTimeout: 4m
+
 `
 
 				dir := fs.NewDir(t, t.Name(),
@@ -192,14 +207,13 @@ users:
 			},
 			expected: func(t *testing.T) server.Options {
 				return server.Options{
-					Version:                  0.2,
+					Version:                  0.3,
 					TLSCache:                 "/cache/dir",
 					SessionDuration:          3 * time.Minute,
-					SessionExtensionDeadline: 1 * time.Minute,
+					SessionInactivityTimeout: 1 * time.Minute,
 
 					DBEncryptionKey:         "/this-is-the-path",
 					DBEncryptionKeyProvider: "the-provider",
-					DBFile:                  "/db/file",
 					DBHost:                  "the-host",
 					DBPort:                  5432,
 					DBParameters:            "sslmode=require",
@@ -277,6 +291,24 @@ users:
 							},
 						},
 					},
+
+					DB: data.NewDBOptions{
+						MaxOpenConnections: 100,
+						MaxIdleConnections: 100,
+						MaxIdleTimeout:     5 * time.Minute,
+					},
+
+					Redis: redis.Options{
+						Host:     "myredis",
+						Port:     6379,
+						Username: "myuser",
+						Password: "mypassword",
+					},
+
+					API: server.APIOptions{
+						RequestTimeout:         2 * time.Minute,
+						BlockingRequestTimeout: 4 * time.Minute,
+					},
 				}
 			},
 		},
@@ -285,25 +317,24 @@ users:
 			setup: func(t *testing.T, cmd *cobra.Command) {
 				cmd.SetArgs([]string{
 					"--db-name", "database-name",
-					"--db-file", "/home/user/database-filename",
 					"--db-port", "12345",
 					"--db-host", "thehostname",
 					"--enable-telemetry=false",
 					"--session-duration", "3m",
-					"--session-extension-deadline", "1m",
+					"--session-inactivity-timeout", "1m",
 					"--enable-signup=false",
 				})
 			},
 			expected: func(t *testing.T) server.Options {
 				expected := defaultServerOptions(filepath.Join(dir, ".infra"))
 				expected.DBName = "database-name"
-				expected.DBFile = "/home/user/database-filename"
 				expected.DBHost = "thehostname"
 				expected.DBPort = 12345
 				expected.EnableTelemetry = false
 				expected.SessionDuration = 3 * time.Minute
-				expected.SessionExtensionDeadline = 1 * time.Minute
+				expected.SessionInactivityTimeout = 1 * time.Minute
 				expected.EnableSignup = false
+				expected.BaseDomain = ""
 				return expected
 			},
 		},
@@ -317,9 +348,11 @@ users:
 }
 
 func TestServerCmd_WithSecretsConfig(t *testing.T) {
+	pgDriver := database.PostgresDriver(t, "_cmd")
 	patchRunServer(t, noServerRun)
 
 	content := `
+      dbConnectionString: ` + pgDriver.DSN + `
       addr:
         http: "127.0.0.1:0"
         https: "127.0.0.1:0"
@@ -393,4 +426,42 @@ func TestServerCmd_NoFlagDefaults(t *testing.T) {
 			t.Fatalf("Flag --%v uses non-zero value %v. %v", flag.Name, flag.Value, msg)
 		}
 	})
+}
+
+func TestCanonicalPath(t *testing.T) {
+	t.Setenv("HOME", "/home/user")
+	t.Setenv("USERPROFILE", "/home/user")
+	wd, err := filepath.EvalSymlinks(t.TempDir())
+	assert.NilError(t, err)
+
+	env.ChangeWorkingDir(t, wd)
+
+	type testCase struct {
+		path     string
+		expected string
+	}
+
+	run := func(t *testing.T, tc testCase) {
+		actual, err := canonicalPath(tc.path)
+		assert.NilError(t, err)
+		assert.Equal(t, tc.expected, actual)
+	}
+
+	testCases := []testCase{
+		{path: "/already/abs", expected: "/already/abs"},
+		{path: "relative/no/dot", expected: wd + "/relative/no/dot"},
+		{path: "./relative/dot", expected: wd + "/relative/dot"},
+		{path: "$HOME/dir", expected: "/home/user/dir"},
+		{path: "${HOME}/dir", expected: "/home/user/dir"},
+		{path: "/not/$HOMEFOO/dir", expected: "/not/dir"},
+		{path: "$HOMEFOO/dir", expected: "/dir"},
+		{path: "~/config", expected: "/home/user/config"},
+		{path: "~user/config", expected: wd + "/~user/config"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("in=%v out=%v", tc.path, tc.expected), func(t *testing.T) {
+			run(t, tc)
+		})
+	}
 }

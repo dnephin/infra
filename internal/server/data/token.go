@@ -8,7 +8,6 @@ import (
 	"gopkg.in/square/go-jose.v2/jwt"
 
 	"github.com/infrahq/infra/internal/claims"
-	"github.com/infrahq/infra/internal/generate"
 	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/uid"
 )
@@ -17,14 +16,14 @@ var signatureAlgorithmFromKeyAlgorithm = map[string]string{
 	"ED25519": "EdDSA", // elliptic curve 25519
 }
 
-func createJWT(db GormTxn, identity *models.Identity, groups []string, expires time.Time) (string, error) {
+func createJWT(db ReadTxn, identity *models.Identity, groups []string, expires time.Time) (string, error) {
 	settings, err := GetSettings(db)
 	if err != nil {
 		return "", err
 	}
 
 	var sec jose.JSONWebKey
-	if err := sec.UnmarshalJSON(settings.PrivateJWK); err != nil {
+	if err := sec.UnmarshalJSON([]byte(settings.PrivateJWK)); err != nil {
 		return "", err
 	}
 
@@ -51,7 +50,6 @@ func createJWT(db GormTxn, identity *models.Identity, groups []string, expires t
 	custom := claims.Custom{
 		Name:   identity.Name,
 		Groups: groups,
-		Nonce:  generate.MathRandom(10, generate.CharsetAlphaNumeric),
 	}
 
 	raw, err := jwt.Signed(signer).Claims(claim).Claims(custom).CompactSerialize()
@@ -62,13 +60,13 @@ func createJWT(db GormTxn, identity *models.Identity, groups []string, expires t
 	return raw, nil
 }
 
-func CreateIdentityToken(db GormTxn, identityID uid.ID) (token *models.Token, err error) {
-	identity, err := GetIdentity(db, ByID(identityID))
+func CreateIdentityToken(db ReadTxn, identityID uid.ID) (token *models.Token, err error) {
+	identity, err := GetIdentity(db, GetIdentityOptions{ByID: identityID})
 	if err != nil {
 		return nil, err
 	}
 
-	identityGroups, err := ListGroups(db, nil, ByGroupMember(identityID))
+	identityGroups, err := ListGroups(db, ListGroupsOptions{ByGroupMember: identityID})
 	if err != nil {
 		return nil, err
 	}

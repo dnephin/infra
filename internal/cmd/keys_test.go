@@ -74,15 +74,15 @@ func TestKeysAddCmd(t *testing.T) {
 		ch := setup(t)
 
 		ctx, bufs := PatchCLI(context.Background())
-		err := Run(ctx, "keys", "add", "--ttl=400h", "--extension-deadline=5h", "--name=the-name", "my-user")
+		err := Run(ctx, "keys", "add", "--expiry=400h", "--inactivity-timeout=5h", "--name=the-name", "--user=my-user")
 		assert.NilError(t, err)
 
 		req := <-ch
 		expected := api.CreateAccessKeyRequest{
 			UserID:            uid.ID(12345678),
 			Name:              "the-name",
-			TTL:               api.Duration(400 * time.Hour),
-			ExtensionDeadline: api.Duration(5 * time.Hour),
+			Expiry:            api.Duration(400 * time.Hour),
+			InactivityTimeout: api.Duration(5 * time.Hour),
 		}
 		assert.DeepEqual(t, expected, req)
 		assert.Equal(t, withNewline(bufs.Stdout.String()), expectedKeysAddOutput)
@@ -92,7 +92,7 @@ func TestKeysAddCmd(t *testing.T) {
 		ch := setup(t)
 
 		ctx, bufs := PatchCLI(context.Background())
-		err := Run(ctx, "keys", "add", "--ttl=400h", "--extension-deadline=5h", "my-user")
+		err := Run(ctx, "keys", "add", "--expiry=400h", "--inactivity-timeout=5h", "--user=my-user")
 		assert.NilError(t, err)
 
 		req := <-ch
@@ -100,10 +100,10 @@ func TestKeysAddCmd(t *testing.T) {
 		assert.Equal(t, withNewline(bufs.Stdout.String()), expectedKeysAddOutput)
 	})
 
-	t.Run("without required arguments", func(t *testing.T) {
-		err := Run(context.Background(), "keys", "add")
-		assert.ErrorContains(t, err, `"infra keys add" requires exactly 1 argument`)
-		assert.ErrorContains(t, err, `Usage:  infra keys add USER`)
+	t.Run("with unexpected arguments", func(t *testing.T) {
+		err := Run(context.Background(), "keys", "add", "something")
+		assert.ErrorContains(t, err, `"infra keys add" accepts no arguments`)
+		assert.ErrorContains(t, err, `Usage:  infra keys add`)
 	})
 }
 
@@ -159,7 +159,7 @@ func TestKeysListCmd(t *testing.T) {
 			}
 
 			resp.WriteHeader(http.StatusOK)
-			if query.Get("user_id") == uid.ID(12345678).String() {
+			if query.Get("userID") == uid.ID(12345678).String() {
 				err := json.NewEncoder(resp).Encode(api.ListResponse[api.AccessKey]{
 					Count: 1,
 					Items: []api.AccessKey{
@@ -190,7 +190,7 @@ func TestKeysListCmd(t *testing.T) {
 						IssuedForName:     "admin",
 						Created:           api.Time(base.Add(time.Minute)),
 						Expires:           api.Time(base.Add(30 * time.Hour)),
-						ExtensionDeadline: api.Time(base.Add(50 * time.Hour)),
+						InactivityTimeout: api.Time(base.Add(50 * time.Hour)),
 					},
 					{
 						Name:          "storage",

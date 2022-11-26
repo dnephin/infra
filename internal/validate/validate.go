@@ -123,7 +123,9 @@ func (e Error) Error() string {
 	return buf.String()
 }
 
-func fail(name string, problems ...string) *Failure {
+// Fail is a convenience function for returning a failure with one or more problems.
+// name is the name of the field in the request.
+func Fail(name string, problems ...string) *Failure {
 	return &Failure{Name: name, Problems: problems}
 }
 
@@ -149,7 +151,7 @@ func (r requiredRule) Validate() *Failure {
 	if !reflect.ValueOf(r.value).IsZero() {
 		return nil
 	}
-	return fail(r.name, "is required")
+	return Fail(r.name, "is required")
 }
 
 // Field is used to construct validation rules that incorporate multiple fields.
@@ -175,7 +177,7 @@ func (m mutuallyExclusive) Validate() *Failure {
 	}
 
 	if len(nonZero) > 1 {
-		return fail("", fmt.Sprintf("only one of (%v) can have a value", strings.Join(nonZero, ", ")))
+		return Fail("", fmt.Sprintf("only one of (%v) can have a value", strings.Join(nonZero, ", ")))
 	}
 	return nil
 }
@@ -201,7 +203,7 @@ func (m requireAnyOf) Validate() *Failure {
 	}
 
 	if len(zero) == len(m) {
-		return fail("", fmt.Sprintf("one of (%v) is required", strings.Join(zero, ", ")))
+		return Fail("", fmt.Sprintf("one of (%v) is required", strings.Join(zero, ", ")))
 	}
 	return nil
 }
@@ -234,10 +236,10 @@ func (m requireOneOf) Validate() *Failure {
 	}
 
 	if len(nonZero) > 1 {
-		return fail("", fmt.Sprintf("only one of (%v) can have a value", strings.Join(nonZero, ", ")))
+		return Fail("", fmt.Sprintf("only one of (%v) can have a value", strings.Join(nonZero, ", ")))
 	}
 	if len(zero) == len(m) {
-		return fail("", fmt.Sprintf("one of (%v) is required", strings.Join(zero, ", ")))
+		return Fail("", fmt.Sprintf("one of (%v) is required", strings.Join(zero, ", ")))
 	}
 	return nil
 }
@@ -285,3 +287,14 @@ func fieldName(f reflect.StructField) string {
 
 	return strings.ToLower(f.Name[:1]) + f.Name[1:]
 }
+
+// ValidatorFunc wraps a function so that it implements ValidationRule. It can
+// be used to create special validations without having to define a type.
+// The ValidationRule will have a no-op implementation of DescribeSchema.
+type ValidatorFunc func() *Failure
+
+func (f ValidatorFunc) Validate() *Failure {
+	return f()
+}
+
+func (f ValidatorFunc) DescribeSchema(*openapi3.Schema) {}

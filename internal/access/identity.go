@@ -15,35 +15,35 @@ import (
 )
 
 // isIdentitySelf is used by authorization checks to see if the calling identity is requesting their own attributes
-func isIdentitySelf(c *gin.Context, userID uid.ID) (bool, error) {
-	identity := AuthenticatedIdentity(c)
-	return identity != nil && identity.ID == userID, nil
+func isIdentitySelf(rCtx RequestContext, opts data.GetIdentityOptions) bool {
+	identity := rCtx.Authenticated.User
+
+	if identity == nil {
+		return false
+	}
+
+	switch {
+	case opts.ByID != 0:
+		return identity.ID == opts.ByID
+	case opts.ByName != "":
+		return identity.Name == opts.ByName
+	}
+
+	return false
 }
 
-// AuthenticatedIdentity returns the identity that is associated with the access key
-// that was used to authenticate the request.
-// Returns nil if there is no identity in the context, which likely means the
-// request was not authenticated.
-//
-// TODO: remove once all callers use RequestContext.Authenticated.User
-// See https://github.com/infrahq/infra/issues/2796
-func AuthenticatedIdentity(c *gin.Context) *models.Identity {
-	if raw, ok := c.Get("identity"); ok {
-		if identity, ok := raw.(*models.Identity); ok {
-			return identity
+func GetIdentity(c *gin.Context, opts data.GetIdentityOptions) (*models.Identity, error) {
+	rCtx := GetRequestContext(c)
+	// anyone can get their own user data
+	if !isIdentitySelf(rCtx, opts) {
+		roles := []string{models.InfraAdminRole, models.InfraViewRole, models.InfraConnectorRole}
+		err := IsAuthorized(rCtx, roles...)
+		if err != nil {
+			return nil, HandleAuthErr(err, "user", "get", roles...)
 		}
 	}
-	return nil
-}
 
-func GetIdentity(c *gin.Context, id uid.ID) (*models.Identity, error) {
-	roles := []string{models.InfraAdminRole, models.InfraViewRole, models.InfraConnectorRole}
-	db, err := hasAuthorization(c, id, isIdentitySelf, roles...)
-	if err != nil {
-		return nil, HandleAuthErr(err, "user", "get", roles...)
-	}
-
-	return data.GetIdentity(db, data.Preload("Providers"), data.ByID(id))
+	return data.GetIdentity(rCtx.DBTxn, opts)
 }
 
 func CreateIdentity(c *gin.Context, identity *models.Identity) error {
@@ -55,22 +55,13 @@ func CreateIdentity(c *gin.Context, identity *models.Identity) error {
 	return data.CreateIdentity(db, identity)
 }
 
-func InfraConnectorIdentity(c *gin.Context) *models.Identity {
-	return data.InfraConnectorIdentity(getDB(c))
-}
-
-// TODO (https://github.com/infrahq/infra/issues/2318) remove provider user, not user.
 func DeleteIdentity(c *gin.Context, id uid.ID) error {
-	self, err := isIdentitySelf(c, id)
-	if err != nil {
-		return err
-	}
-
-	if self {
+	rCtx := GetRequestContext(c)
+	if isIdentitySelf(rCtx, data.GetIdentityOptions{ByID: id}) {
 		return fmt.Errorf("cannot delete self: %w", internal.ErrBadRequest)
 	}
 
-	if InfraConnectorIdentity(c).ID == id {
+	if data.InfraConnectorIdentity(rCtx.DBTxn).ID == id {
 		return fmt.Errorf("%w: the connector user can not be deleted", internal.ErrBadRequest)
 	}
 
@@ -79,39 +70,11 @@ func DeleteIdentity(c *gin.Context, id uid.ID) error {
 		return HandleAuthErr(err, "user", "delete", models.InfraAdminRole)
 	}
 
-	if err := data.DeleteAccessKeys(db, data.ByIssuedFor(id)); err != nil {
-		return fmt.Errorf("delete identity access keys: %w", err)
+	opts := data.DeleteIdentitiesOptions{
+		ByProviderID: data.InfraProvider(db).ID,
+		ByID:         id,
 	}
-
-	groups, err := data.ListGroups(db, nil, data.ByGroupMember(id))
-	if err != nil {
-		return fmt.Errorf("list groups for identity: %w", err)
-	}
-	for _, group := range groups {
-		err = data.RemoveUsersFromGroup(db, group.ID, []uid.ID{id})
-		if err != nil {
-			return fmt.Errorf("delete group membership for identity: %w", err)
-		}
-	}
-	// if an identity does not have credentials in the Infra provider this won't be found, but we can proceed
-	credential, err := data.GetCredential(db, data.ByIdentityID(id))
-	if err != nil && !errors.Is(err, internal.ErrNotFound) {
-		return fmt.Errorf("get delete identity creds: %w", err)
-	}
-
-	if credential != nil {
-		err := data.DeleteCredential(db, credential.ID)
-		if err != nil {
-			return fmt.Errorf("delete identity creds: %w", err)
-		}
-	}
-
-	err = data.DeleteGrants(db, data.BySubject(uid.NewIdentityPolymorphicID(id)))
-	if err != nil {
-		return fmt.Errorf("delete identity creds: %w", err)
-	}
-
-	return data.DeleteIdentity(db, id)
+	return data.DeleteIdentities(db, opts)
 }
 
 func ListIdentities(c *gin.Context, name string, groupID uid.ID, ids []uid.ID, showSystem bool, p *data.Pagination) ([]models.Identity, error) {
@@ -121,22 +84,36 @@ func ListIdentities(c *gin.Context, name string, groupID uid.ID, ids []uid.ID, s
 		return nil, HandleAuthErr(err, "users", "list", roles...)
 	}
 
-	selectors := []data.SelectorFunc{
-		data.Preload("Providers"),
-		data.ByOptionalName(name),
-		data.ByOptionalIDs(ids),
-		data.ByOptionalIdentityGroupID(groupID),
+	opts := data.ListIdentityOptions{
+		Pagination:    p,
+		ByName:        name,
+		ByIDs:         ids,
+		ByGroupID:     groupID,
+		LoadProviders: true,
 	}
 
 	if !showSystem {
-		selectors = append(selectors, data.NotName(models.InternalInfraConnectorIdentityName))
+		opts.ByNotName = models.InternalInfraConnectorIdentityName
 	}
 
-	return data.ListIdentities(db, p, selectors...)
+	return data.ListIdentities(db, opts)
 }
 
 func GetContextProviderIdentity(c RequestContext) (*models.Provider, string, error) {
 	// does not need authorization check, this action is limited to the calling user
+	provider, err := data.GetProvider(c.DBTxn, data.GetProviderOptions{
+		ByID: c.Authenticated.AccessKey.ProviderID,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("user info provider: %w", err)
+	}
+
+	if provider.Kind == models.ProviderKindInfra {
+		// no external verification needed
+		logging.L.Trace().Msg("skipped verifying identity within infra provider, not required")
+		return provider, "", nil
+	}
+
 	identity := c.Authenticated.User
 	if identity == nil {
 		return nil, "", errors.New("user does not have session with an identity provider")
@@ -145,11 +122,6 @@ func GetContextProviderIdentity(c RequestContext) (*models.Provider, string, err
 	providerUser, err := data.GetProviderUser(c.DBTxn, c.Authenticated.AccessKey.ProviderID, identity.ID)
 	if err != nil {
 		return nil, "", err
-	}
-
-	provider, err := data.GetProvider(c.DBTxn, data.ByID(providerUser.ProviderID))
-	if err != nil {
-		return nil, "", fmt.Errorf("user info provider: %w", err)
 	}
 
 	return provider, providerUser.RedirectURL, nil
@@ -167,7 +139,9 @@ func UpdateIdentityInfoFromProvider(c RequestContext, oidc providers.OIDCClient)
 	}
 
 	db := c.DBTxn
-	provider, err := data.GetProvider(db, data.ByID(c.Authenticated.AccessKey.ProviderID))
+	provider, err := data.GetProvider(db, data.GetProviderOptions{
+		ByID: c.Authenticated.AccessKey.ProviderID,
+	})
 	if err != nil {
 		return fmt.Errorf("user info provider: %w", err)
 	}
@@ -179,11 +153,11 @@ func UpdateIdentityInfoFromProvider(c RequestContext, oidc providers.OIDCClient)
 			return err
 		}
 
-		if nestedErr := data.DeleteAccessKeys(db, data.ByIssuedFor(identity.ID)); nestedErr != nil {
+		if nestedErr := data.DeleteAccessKeys(db, data.DeleteAccessKeysOptions{ByIssuedForID: identity.ID}); nestedErr != nil {
 			logging.Errorf("failed to revoke invalid user session: %s", nestedErr)
 		}
 
-		if nestedErr := data.DeleteProviderUsers(db, data.ByIdentityID(identity.ID), data.ByProviderID(provider.ID)); nestedErr != nil {
+		if nestedErr := data.DeleteProviderUsers(db, data.DeleteProviderUsersOptions{ByIdentityID: identity.ID, ByProviderID: provider.ID}); nestedErr != nil {
 			logging.Errorf("failed to delete provider user: %s", nestedErr)
 		}
 

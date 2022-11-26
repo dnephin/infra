@@ -29,6 +29,16 @@ type StringRule struct {
 	FirstCharacterRange []CharRange
 }
 
+func String(name, value string, minLength, maxLength int, charset []CharRange) StringRule {
+	return StringRule{
+		Name:            name,
+		Value:           value,
+		MinLength:       minLength,
+		MaxLength:       maxLength,
+		CharacterRanges: charset,
+	}
+}
+
 type CharRange struct {
 	Low  rune
 	High rune
@@ -45,14 +55,15 @@ func (r CharRange) String() string {
 }
 
 var (
-	AlphabetLower = CharRange{Low: 'a', High: 'z'}
-	AlphabetUpper = CharRange{Low: 'A', High: 'Z'}
-	Numbers       = CharRange{Low: '0', High: '9'}
-	Dash          = CharRange{Low: '-', High: '-'}
-	Underscore    = CharRange{Low: '_', High: '_'}
-	Dot           = CharRange{Low: '.', High: '.'}
-	AtSign        = CharRange{Low: '@', High: '@'}
-	AlphaNumeric  = []CharRange{AlphabetLower, AlphabetUpper, Numbers}
+	AlphabetLower      = CharRange{Low: 'a', High: 'z'}
+	AlphabetUpper      = CharRange{Low: 'A', High: 'Z'}
+	Numbers            = CharRange{Low: '0', High: '9'}
+	Dash               = CharRange{Low: '-', High: '-'}
+	Underscore         = CharRange{Low: '_', High: '_'}
+	Dot                = CharRange{Low: '.', High: '.'}
+	AtSign             = CharRange{Low: '@', High: '@'}
+	AlphaNumeric       = []CharRange{AlphabetLower, AlphabetUpper, Numbers}
+	DeviceFlowUserCode = []CharRange{{Low: 'B', High: 'D'}, {Low: 'F', High: 'H'}, {Low: 'J', High: 'N'}, {Low: 'P', High: 'T'}, {Low: 'V', High: 'X'}, {Low: 'Z', High: 'Z'}}
 )
 
 func (s StringRule) DescribeSchema(parent *openapi3.Schema) {
@@ -108,7 +119,7 @@ func (s StringRule) Validate() *Failure {
 	}
 
 	if len(problems) > 0 {
-		return fail(s.Name, problems...)
+		return Fail(s.Name, problems...)
 	}
 	return nil
 }
@@ -144,7 +155,7 @@ func (e enum) Validate() *Failure {
 		}
 	}
 	msg := fmt.Sprintf("must be one of (%v)", strings.Join(e.Allowed, ", "))
-	return fail(e.Name, msg)
+	return Fail(e.Name, msg)
 }
 
 func (e enum) DescribeSchema(parent *openapi3.Schema) {
@@ -173,7 +184,7 @@ func (r reserved) Validate() *Failure {
 	for _, notAllowed := range r.Reserved {
 		if r.Value == notAllowed {
 			msg := fmt.Sprintf("%v is reserved and can not be used", r.Value)
-			return fail(r.Name, msg)
+			return Fail(r.Name, msg)
 		}
 	}
 	return nil

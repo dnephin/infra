@@ -34,9 +34,6 @@ type Migration struct {
 }
 
 type DB interface {
-	// DriverName returns the name of the database driver.
-	DriverName() string
-
 	Exec(stmt string, args ...any) (sql.Result, error)
 	Query(query string, args ...any) (*sql.Rows, error)
 	QueryRow(query string, args ...any) *sql.Row
@@ -170,7 +167,7 @@ func (g *Migrator) rollbackMigration(m *Migration) error {
 	if err := m.Rollback(g.tx); err != nil {
 		return err
 	}
-	_, err := g.tx.Exec("DELETE FROM migrations WHERE id = ?", m.ID)
+	_, err := g.tx.Exec("DELETE FROM migrations WHERE id = $1", m.ID)
 	return err
 }
 
@@ -205,7 +202,6 @@ func (g *Migrator) runMigration(migration *Migration) error {
 }
 
 func (g *Migrator) createMigrationTableIfNotExists() error {
-	// TODO: replace gorm helper
 	if HasTable(g.tx, "migrations") {
 		return nil
 	}
@@ -218,7 +214,7 @@ func (g *Migrator) createMigrationTableIfNotExists() error {
 // individually
 func (g *Migrator) migrationRan(m *Migration) (bool, error) {
 	var count int64
-	err := g.tx.QueryRow(`SELECT count(id) FROM migrations WHERE id = ?`, m.ID).Scan(&count)
+	err := g.tx.QueryRow(`SELECT count(id) FROM migrations WHERE id = $1`, m.ID).Scan(&count)
 	return count > 0, err
 }
 
@@ -238,6 +234,6 @@ func (g *Migrator) mustInitializeSchema() (bool, error) {
 }
 
 func (g *Migrator) insertMigration(id string) error {
-	_, err := g.tx.Exec("INSERT INTO migrations (id) VALUES (?)", id)
+	_, err := g.tx.Exec("INSERT INTO migrations (id) VALUES ($1)", id)
 	return err
 }

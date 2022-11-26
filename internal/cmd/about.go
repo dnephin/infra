@@ -18,11 +18,11 @@ type triangle struct {
 
 func newAboutCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:    "about",
-		Short:  "Display information about Infra",
-		Args:   NoArgs,
-		Group:  "Other commands:",
-		Hidden: false,
+		Use:     "about",
+		Short:   "Display information about Infra",
+		Args:    NoArgs,
+		GroupID: groupOther,
+		Hidden:  false,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return about()
 		},
@@ -419,7 +419,7 @@ mainloop:
 		case ev := <-eventQueue:
 			if ev.Type == tm.EventKey {
 				switch {
-				case ev.Key == tm.KeyEsc:
+				case ev.Key == tm.KeyEsc || ev.Key == tm.KeyCtrlC || ev.Ch == 'q':
 					break mainloop
 				case ev.Key == tm.KeyArrowRight:
 					i.angleX += 0.01

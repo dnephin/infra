@@ -1,63 +1,135 @@
-import Head from 'next/head'
-import Link from 'next/link'
-import { useRouter } from 'next/router'
 import { useState } from 'react'
+import Head from 'next/head'
+import { useRouter } from 'next/router'
+import Link from 'next/link'
+
 import useSWR from 'swr'
+import moment from 'moment'
+import {
+  TrashIcon,
+  ChevronDownIcon,
+  CheckIcon,
+} from '@heroicons/react/24/outline'
+import { Menu } from '@headlessui/react'
 
+import { useUser } from '../../lib/hooks'
 import { sortBySubject } from '../../lib/grants'
-import { useAdmin } from '../../lib/admin'
 
+import GrantForm from '../../components/grant-form'
 import Dashboard from '../../components/layouts/dashboard'
 import DeleteModal from '../../components/delete-modal'
-import Notification from '../../components/notification'
-import GrantForm from '../../components/grant-form'
+import Table from '../../components/table'
 
-function AdminGrant({ name, showRemove, onRemove, message = '' }) {
-  const [open, setOpen] = useState(false)
+const TAB_ACCESS_KEY = { name: 'access_keys', title: 'Access Keys' }
+const TAB_ORG_ADMINS = { name: 'admins', title: 'Organization Admins' }
+const TAB_PROVIDERS = { name: 'providers', title: 'Providers' }
+
+function AdminList({ grants, users, groups, onRemove, auth, selfGroups }) {
+  const grantsList = grants?.sort(sortBySubject)?.map(grant => {
+    const message =
+      grant?.user === auth?.id
+        ? 'Are you sure you want to remove yourself as an admin?'
+        : selfGroups?.some(g => g.id === grant.group)
+        ? `Are you sure you want to revoke this group's admin access? You are a member of this group.`
+        : undefined
+
+    const name =
+      users?.find(u => grant.user === u.id)?.name ||
+      groups?.find(group => grant.group === group.id)?.name ||
+      ''
+
+    return { ...grant, message, name }
+  })
 
   return (
-    <div className='group flex items-center justify-between py-1 text-2xs'>
-      <div className='py-1.5'>{name}</div>
-      {showRemove && (
-        <div className='flex justify-end text-right opacity-0 group-hover:opacity-100'>
-          <button
-            onClick={() => setOpen(true)}
-            className='-mr-2 flex-none cursor-pointer px-2 py-1 text-2xs text-gray-500 hover:text-violet-100'
-          >
-            Revoke
-          </button>
-          <DeleteModal
-            open={open}
-            setOpen={setOpen}
-            primaryButtonText='Revoke'
-            onSubmit={onRemove}
-            title='Revoke Admin'
-            message={
-              !message ? (
-                <>
-                  Are you sure you want to revoke admin access for{' '}
-                  <span className='font-bold text-white'>{name}</span>?
-                </>
-              ) : (
-                message
+    <Table
+      data={grantsList}
+      columns={[
+        {
+          cell: function Cell(info) {
+            return (
+              <div className='flex flex-col'>
+                <div className='flex items-center font-medium text-gray-700'>
+                  {info.getValue()}
+                </div>
+                <div className='text-2xs text-gray-500'>
+                  {info.row.original.user && 'User'}
+                  {info.row.original.group && 'Group'}
+                </div>
+              </div>
+            )
+          },
+          header: () => <span>Admin</span>,
+          accessorKey: 'name',
+        },
+        {
+          cell: function Cell(info) {
+            const [open, setOpen] = useState(false)
+            const [deleteId, setDeleteId] = useState(null)
+
+            return (
+              grants?.length > 1 && (
+                <div className='text-right'>
+                  <button
+                    onClick={() => {
+                      setDeleteId(info.row.original.id)
+                      setOpen(true)
+                    }}
+                    className='p-1 text-2xs text-gray-500/75 hover:text-gray-600'
+                  >
+                    Revoke
+                    <span className='sr-only'>{info.row.original.name}</span>
+                  </button>
+                  <DeleteModal
+                    open={open}
+                    setOpen={setOpen}
+                    primaryButtonText='Revoke'
+                    onSubmit={() => {
+                      onRemove(deleteId)
+                      setOpen(false)
+                    }}
+                    title='Revoke Admin'
+                    message={
+                      !grantsList?.find(grant => grant.id === deleteId)
+                        ?.message ? (
+                        <>
+                          Are you sure you want to revoke admin access for{' '}
+                          <span className='font-bold'>
+                            {
+                              grantsList?.find(grant => grant.id === deleteId)
+                                ?.name
+                            }
+                          </span>
+                          ?
+                        </>
+                      ) : (
+                        grantsList?.find(grant => grant.id === deleteId)
+                          ?.message
+                      )
+                    }
+                  />
+                </div>
               )
-            }
-          />
-        </div>
-      )}
-    </div>
+            )
+          },
+          id: 'delete',
+        },
+      ]}
+    />
   )
 }
 
 export default function Settings() {
   const router = useRouter()
-  const { data: auth } = useSWR('/api/users/self')
-  const { admin } = useAdmin()
 
-  const { resetPassword } = router.query
-  const [showNotification, setshowNotification] = useState(
-    resetPassword === 'success'
-  )
+  const { user, isAdmin } = useUser()
+
+  const page = router.query.p === undefined ? 1 : router.query.p
+  const limit = 20
+  const {
+    data: { items: accessKeys, totalPages, totalCount } = {},
+    mutate: accessKeyMutate,
+  } = useSWR(`/api/access-keys?userID=${user.id}&page=${page}&limit=${limit}`)
 
   const { data: { items: users } = {} } = useSWR('/api/users?limit=1000')
   const { data: { items: groups } = {} } = useSWR('/api/groups?limit=1000')
@@ -65,122 +137,382 @@ export default function Settings() {
     '/api/grants?resource=infra&privilege=admin&limit=1000'
   )
   const { data: { items: selfGroups } = {} } = useSWR(
-    `/api/groups?userID=${auth?.id}&limit=1000`
+    () => `/api/groups?userID=${user?.id}&limit=1000`
+  )
+  const { data: { items: providers } = {} } = useSWR(
+    `/api/providers?page=${page}&limit=1000`
   )
 
-  const hasInfraProvider = auth?.providerNames.includes('infra')
+  const tabs = isAdmin ? [TAB_ACCESS_KEY, TAB_ORG_ADMINS, TAB_PROVIDERS] : []
+  const tab = router.query.tab || TAB_ACCESS_KEY.name
 
   return (
-    <>
+    <div className='my-6'>
       <Head>
         <title>Settings - Infra</title>
       </Head>
+      <div className='flex flex-1 flex-col'>
+        {/* Header */}
+        <h1 className='mb-6 font-display text-xl font-medium'>Settings</h1>
 
-      {auth && (
-        <div className='mt-6 mb-4 flex flex-1 flex-col space-y-8'>
-          <h1 className='mb-6 text-xs font-bold'>Settings</h1>
-          {hasInfraProvider && (
-            <div className='w-full max-w-md pb-12'>
-              <div className='border-b border-gray-800 pb-3 text-2xs uppercase leading-none text-gray-400'>
-                Account
-              </div>
-              <div className='flex flex-col space-y-2 pt-6'>
-                <div className='group flex'>
-                  <div className='flex flex-1 items-center'>
-                    <div className='w-[26%] text-2xs text-gray-400'>Email</div>
-                    <div className='text-2xs'>{auth?.name}</div>
+        {/* Tabs */}
+        {tabs.length > 0 && (
+          <div>
+            <div className='mb-4 sm:hidden'>
+              <label htmlFor='tabs' className='sr-only'>
+                Select a tab from settings page
+              </label>
+              <Menu as='div' className='relative inline-block w-full text-left'>
+                <Menu.Button className='inline-flex w-full items-center justify-between rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 shadow-sm hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-gray-100'>
+                  {tabs.find(t => t.name === tab).title}
+                  <ChevronDownIcon
+                    className='ml-2 h-4 w-4'
+                    aria-hidden='true'
+                  />
+                </Menu.Button>
+
+                <Menu.Items className='absolute right-0 z-10 mt-2 w-full origin-top-right rounded-md bg-white shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none'>
+                  <div className='py-1'>
+                    {tabs.map(t => (
+                      <Menu.Item key={t.name}>
+                        {({ active }) => (
+                          <Link
+                            href={{
+                              pathname: `/settings/`,
+                              query: { tab: t.name },
+                            }}
+                            className={`
+                            ${
+                              active
+                                ? 'bg-gray-100 text-gray-900'
+                                : 'text-gray-700'
+                            }
+                            flex items-center justify-between px-4 py-2 text-sm`}
+                          >
+                            {t.title}
+                            {tab === t.name && (
+                              <CheckIcon
+                                className='h-3 w-3 text-gray-900'
+                                aria-hidden='true'
+                              />
+                            )}
+                          </Link>
+                        )}
+                      </Menu.Item>
+                    ))}
                   </div>
-                </div>
-                <div className='group flex'>
-                  <div className='flex flex-1 items-center'>
-                    <div className='w-[30%] text-2xs text-gray-400'>
-                      Password
-                    </div>
-                    <div className='text-2xs'>********</div>
-                  </div>
-                  <div className='flex justify-end'>
-                    <Link href='/settings/password-reset'>
-                      <a className='-mr-2 flex-none cursor-pointer p-2 text-2xs uppercase text-gray-500 hover:text-violet-100'>
-                        Change
-                      </a>
+                </Menu.Items>
+              </Menu>
+            </div>
+            <div className='hidden sm:block'>
+              <div className='mb-3 border-b border-gray-200'>
+                <nav className='-mb-px flex' aria-label='Tabs'>
+                  {tabs.map(t => (
+                    <Link
+                      key={t.name}
+                      href={{
+                        pathname: `/settings/`,
+                        query: { tab: t.name },
+                      }}
+                      className={`
+                ${
+                  tab === t.name
+                    ? 'border-blue-500 text-blue-600'
+                    : 'border-transparent text-gray-500 hover:text-gray-600'
+                }
+                 whitespace-nowrap border-b-2 py-2 px-5 text-sm font-medium capitalize transition-colors`}
+                      aria-current={tab.current ? 'page' : undefined}
+                    >
+                      {t.title}
                     </Link>
-                  </div>
-                </div>
+                  ))}
+                </nav>
               </div>
             </div>
-          )}
-          {resetPassword && (
-            <Notification
-              show={showNotification}
-              setShow={setshowNotification}
-              text='Password Successfully Reset'
-            />
-          )}
-        </div>
-      )}
-      {admin && (
-        <div className='max-w-md'>
-          <div className='border-b border-gray-800 pb-6 text-2xs uppercase leading-none text-gray-400'>
-            Admins
           </div>
-          <GrantForm
-            resource='infra'
-            roles={['admin']}
-            onSubmit={async ({ user, group }) => {
-              // don't add grants that already exist
-              if (grants?.find(g => g.user === user && g.group === group)) {
-                return false
-              }
+        )}
 
-              const res = await fetch('/api/grants', {
-                method: 'POST',
-                body: JSON.stringify({
-                  user,
-                  group,
-                  privilege: 'admin',
-                  resource: 'infra',
-                }),
-              })
+        {/* Access Key */}
+        {tab === TAB_ACCESS_KEY.name && (
+          <>
+            <header
+              className={`my-2 flex items-center ${
+                isAdmin ? 'justify-end' : 'justify-between'
+              }`}
+            >
+              {!isAdmin && (
+                <h2 className='font-display text-lg font-medium'>
+                  Access Keys
+                </h2>
+              )}
+              <Link
+                href='/settings/access-key/add'
+                className='inline-flex items-center rounded-md border border-transparent bg-black  px-4 py-2 text-xs font-medium text-white shadow-sm hover:cursor-pointer hover:bg-gray-800'
+              >
+                Add access key
+              </Link>
+            </header>
+            <div className='mt-3 flex min-h-0 flex-1 flex-col'>
+              <Table
+                count={totalCount}
+                pageCount={totalPages}
+                pageIndex={parseInt(page) - 1}
+                pageSize={limit}
+                data={accessKeys}
+                empty='No access keys'
+                onPageChange={({ pageIndex }) => {
+                  router.push({
+                    pathname: router.pathname,
+                    query: { ...router.query, p: pageIndex + 1 },
+                  })
+                }}
+                columns={[
+                  {
+                    cell: function Cell(info) {
+                      return (
+                        <div className='flex flex-col py-0.5'>
+                          <div className='truncate text-sm font-medium text-gray-700'>
+                            {info.getValue()}
+                          </div>
+                          {info.row.original.created && (
+                            <div className='space-y-1 pt-2 text-3xs text-gray-500 sm:hidden'>
+                              created -{' '}
+                              <span className='font-semibold text-gray-700'>
+                                {moment(info.row.original.created).from()}
+                              </span>
+                            </div>
+                          )}
+                          {info.row.original.lastUsed && (
+                            <div className='space-y-1 pt-2 text-3xs text-gray-500 sm:hidden'>
+                              last used -{' '}
+                              <span className='font-semibold text-gray-700'>
+                                {moment(info.row.original.lastUsed).from()}
+                              </span>
+                            </div>
+                          )}
+                          <div className='space-y-1 pt-2 text-3xs text-gray-500 sm:hidden'>
+                            the key will expire on{' '}
+                            <span className='font-semibold text-gray-700'>
+                              {moment(info.row.original.expires).format(
+                                'YYYY/MM/DD'
+                              )}
+                            </span>
+                          </div>
+                        </div>
+                      )
+                    },
+                    header: () => <span>Name</span>,
+                    accessorKey: 'name',
+                  },
+                  {
+                    cell: info => (
+                      <div className='hidden sm:table-cell'>
+                        {info.getValue() ? moment(info.getValue()).from() : '-'}
+                      </div>
+                    ),
+                    header: () => (
+                      <span className='hidden sm:table-cell'>Created</span>
+                    ),
+                    accessorKey: 'created',
+                  },
+                  {
+                    cell: info => (
+                      <div className='hidden sm:table-cell'>
+                        {info.getValue() ? moment(info.getValue()).from() : '-'}
+                      </div>
+                    ),
+                    header: () => (
+                      <span className='hidden sm:table-cell'>Last used</span>
+                    ),
+                    accessorKey: 'lastUsed',
+                  },
+                  {
+                    cell: info => (
+                      <div className='hidden sm:table-cell'>
+                        {info.getValue() ? moment(info.getValue()).from() : '-'}
+                      </div>
+                    ),
+                    header: () => (
+                      <span className='hidden sm:table-cell'>Expires</span>
+                    ),
+                    accessorKey: 'expires',
+                  },
+                  {
+                    id: 'delete',
+                    cell: function Cell(info) {
+                      const [openDeleteModal, setOpenDeleteModal] =
+                        useState(false)
 
-              mutate({ items: [...grants, await res.json()] })
-            }}
-          />
-          <div className='mt-6'>
-            {grants
-              ?.sort(sortBySubject)
-              ?.map(grant => {
-                const message =
-                  grant?.user === auth?.id
-                    ? 'Are you sure you want to revoke your own admin access?'
-                    : selfGroups?.some(g => g.id === grant.group)
-                    ? `Are you sure you want to revoke this group's admin access? You are a member of this group.`
-                    : undefined
+                      const { name, id } = info.row.original
 
-                return { ...grant, message }
-              })
-              ?.map(g => (
-                <AdminGrant
-                  key={g.id}
-                  name={
-                    users?.find(u => g.user === u.id)?.name ||
-                    groups?.find(group => g.group === group.id)?.name ||
-                    ''
+                      return (
+                        <div className='flex justify-end'>
+                          <button
+                            type='button'
+                            onClick={() => {
+                              setOpenDeleteModal(true)
+                            }}
+                            className='group flex w-full items-center rounded-md bg-white px-2 py-1.5 text-xs font-medium text-red-500'
+                          >
+                            <TrashIcon className='mr-2 h-3.5 w-3.5' />
+                            <span className='hidden sm:block'>Remove</span>
+                          </button>
+                          <DeleteModal
+                            open={openDeleteModal}
+                            setOpen={setOpenDeleteModal}
+                            primaryButtonText='Remove'
+                            onSubmit={async () => {
+                              await fetch(`/api/access-keys/${id}`, {
+                                method: 'DELETE',
+                              })
+                              setOpenDeleteModal(false)
+
+                              accessKeyMutate()
+                            }}
+                            title='Remove Access Key'
+                            message={
+                              <div>
+                                Are you sure you want to remove access key:{' '}
+                                <span className='break-all font-bold'>
+                                  {name}
+                                </span>
+                                ?
+                              </div>
+                            }
+                          />
+                        </div>
+                      )
+                    },
+                  },
+                ]}
+              />
+            </div>
+          </>
+        )}
+
+        {/* Infra admins */}
+        {tab === TAB_ORG_ADMINS.name && (
+          <>
+            <p className='mt-1 mb-4 text-xs text-gray-500'>
+              These users and groups have full access to this organization.
+            </p>
+            <div className='mb-5 w-full rounded-lg border border-gray-200/75 px-5 py-3'>
+              <GrantForm
+                resource='infra'
+                roles={['admin']}
+                grants={grants}
+                multiselect={false}
+                onSubmit={async ({ user, group }) => {
+                  // don't add grants that already exist
+                  if (grants?.find(g => g.user === user && g.group === group)) {
+                    return false
                   }
-                  showRemove={grants?.length > 1}
-                  message={g.message}
-                  onRemove={async () => {
-                    await fetch(`/api/grants/${g.id}`, { method: 'DELETE' })
-                    mutate({ items: grants?.filter(x => x.id !== g.id) })
-                  }}
-                />
-              ))}
-          </div>
-        </div>
-      )}
-    </>
+
+                  await fetch('/api/grants', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      user,
+                      group,
+                      privilege: 'admin',
+                      resource: 'infra',
+                    }),
+                  })
+
+                  // TODO: add optimistic updates
+                  mutate()
+                }}
+              />
+            </div>
+            <AdminList
+              grants={grants}
+              users={users}
+              groups={groups}
+              selfGroups={selfGroups}
+              auth={user}
+              onRemove={async grantId => {
+                await fetch(`/api/grants/${grantId}`, {
+                  method: 'DELETE',
+                })
+                mutate({ items: grants?.filter(x => x.id !== grantId) })
+              }}
+            />
+          </>
+        )}
+
+        {/* Providers */}
+        {tab === TAB_PROVIDERS.name && (
+          <>
+            <header className='my-2 flex items-center justify-end'>
+              <Link
+                href='/settings/providers/add'
+                className='inline-flex items-center rounded-md border border-transparent bg-black  px-4 py-2 text-xs font-medium text-white shadow-sm hover:cursor-pointer hover:bg-gray-800'
+              >
+                Connect provider
+              </Link>
+            </header>
+            <div className='mt-3 flex min-h-0 flex-1 flex-col'>
+              <Table
+                href={row => `/settings/providers/${row.original.id}`}
+                data={providers?.filter(p => p.id !== '')} // remove google login provider
+                empty='No providers'
+                columns={[
+                  {
+                    cell: info => (
+                      <div className='flex flex-row items-center py-1'>
+                        <div className='mr-3 flex h-9 w-9 flex-none items-center justify-center rounded-md border border-gray-200'>
+                          <img
+                            alt='provider icon'
+                            className='h-4'
+                            src={`/providers/${info.row.original.kind}.svg`}
+                          />
+                        </div>
+                        <div className='flex flex-col'>
+                          <div className='text-sm font-medium text-gray-700'>
+                            {info.getValue()}
+                          </div>
+                          <div className='text-2xs text-gray-500 sm:hidden'>
+                            {info.row.original.url}
+                          </div>
+                          <div className='font-mono text-2xs text-gray-400 lg:hidden'>
+                            {info.row.original.clientID}
+                          </div>
+                        </div>
+                      </div>
+                    ),
+                    header: () => <span>Name</span>,
+                    accessorKey: 'name',
+                  },
+                  {
+                    cell: info => (
+                      <div className='hidden sm:table-cell'>
+                        {info.getValue()}
+                      </div>
+                    ),
+                    header: () => (
+                      <span className='hidden sm:table-cell'>URL</span>
+                    ),
+                    accessorKey: 'url',
+                  },
+                  {
+                    cell: info => (
+                      <div className='hidden font-mono lg:table-cell'>
+                        {info.getValue()}
+                      </div>
+                    ),
+                    header: () => (
+                      <span className='hidden lg:table-cell'>Client ID</span>
+                    ),
+                    accessorKey: 'clientID',
+                  },
+                ]}
+              />
+            </div>
+          </>
+        )}
+      </div>
+    </div>
   )
 }
-
-Settings.layout = function (page) {
+Settings.layout = page => {
   return <Dashboard>{page}</Dashboard>
 }

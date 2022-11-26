@@ -10,7 +10,6 @@ import (
 	"github.com/infrahq/infra/internal/access"
 	"github.com/infrahq/infra/internal/logging"
 	"github.com/infrahq/infra/internal/server/data"
-	"github.com/infrahq/infra/internal/server/models"
 	"github.com/infrahq/infra/uid"
 )
 
@@ -18,12 +17,12 @@ type Properties = analytics.Properties
 
 type Telemetry struct {
 	client  analytics.Client
-	db      data.GormTxn
+	db      *data.DB
 	infraID uid.ID
 }
 
 // todo: store global settings like email/signup configured
-func NewTelemetry(db data.GormTxn, infraID uid.ID) *Telemetry {
+func NewTelemetry(db *data.DB, infraID uid.ID) *Telemetry {
 	return &Telemetry{
 		client:  analytics.New(internal.TelemetryWriteKey),
 		db:      db,
@@ -65,32 +64,32 @@ func (t *Telemetry) Close() {
 }
 
 func (t *Telemetry) EnqueueHeartbeat() {
-	users, err := data.GlobalCount[models.Identity](t.db)
+	users, err := data.CountAllIdentities(t.db)
 	if err != nil {
 		logging.Debugf("%s", err.Error())
 	}
 
-	groups, err := data.GlobalCount[models.Group](t.db)
+	groups, err := data.CountAllGroups(t.db)
 	if err != nil {
 		logging.Debugf("%s", err.Error())
 	}
 
-	grants, err := data.GlobalCount[models.Grant](t.db)
+	grants, err := data.CountAllGrants(t.db)
 	if err != nil {
 		logging.Debugf("%s", err.Error())
 	}
 
-	providers, err := data.GlobalCount[models.Provider](t.db)
+	providers, err := data.CountAllProviders(t.db)
 	if err != nil {
 		logging.Debugf("%s", err.Error())
 	}
 
-	destinations, err := data.GlobalCount[models.Destination](t.db)
+	destinations, err := data.CountAllDestinations(t.db)
 	if err != nil {
 		logging.Debugf("%s", err.Error())
 	}
 
-	t.Event("heartbeat", "", map[string]interface{}{
+	t.Event("heartbeat", "", "", map[string]interface{}{
 		"users":        users,
 		"groups":       groups,
 		"providers":    providers,
@@ -100,17 +99,22 @@ func (t *Telemetry) EnqueueHeartbeat() {
 }
 
 func (t *Telemetry) RouteEvent(c *gin.Context, event string, properties ...map[string]interface{}) {
-	var uid string
+	var uid, oid string
 	if c != nil {
-		if u := access.AuthenticatedIdentity(c); u != nil {
-			uid = u.ID.String()
+		a := access.GetRequestContext(c).Authenticated
+		if user := a.User; user != nil {
+			uid = user.ID.String()
+		}
+
+		if org := a.Organization; org != nil {
+			oid = org.ID.String()
 		}
 	}
 
-	t.Event(event, uid, properties...)
+	t.Event(event, uid, oid, properties...)
 }
 
-func (t *Telemetry) Event(event string, userId string, properties ...map[string]interface{}) {
+func (t *Telemetry) Event(event string, userId string, orgId string, properties ...map[string]interface{}) {
 	if t == nil {
 		return
 	}
@@ -119,7 +123,9 @@ func (t *Telemetry) Event(event string, userId string, properties ...map[string]
 		UserId:      userId,
 		Timestamp:   time.Now().UTC(),
 		Event:       "server:" + event,
-		Properties:  analytics.Properties{},
+		Properties: map[string]interface{}{
+			"orgId": orgId,
+		},
 	}
 
 	if len(properties) > 0 {
@@ -147,13 +153,19 @@ func (t *Telemetry) User(id string, name string) {
 	}
 }
 
-func (t *Telemetry) Org(id, userID, name string) {
+func (t *Telemetry) Org(id, userID, name, domain string) {
 	if t == nil {
 		return
 	}
 	err := t.Enqueue(analytics.Group{
-		GroupId:   id,
-		Traits:    analytics.NewTraits().SetName(name),
+		GroupId: id,
+		UserId:  userID,
+		Traits: map[string]interface{}{
+			"name":   name,
+			"$name":  name,
+			"domain": domain,
+			"orgId":  id,
+		},
 		Timestamp: time.Now().UTC(),
 	})
 	if err != nil {
@@ -169,6 +181,9 @@ func (t *Telemetry) OrgMembership(orgID, userID string) {
 		GroupId:   orgID,
 		UserId:    userID,
 		Timestamp: time.Now().UTC(),
+		Traits: map[string]interface{}{
+			"orgId": orgID,
+		},
 	})
 	if err != nil {
 		logging.Debugf("%s", err.Error())

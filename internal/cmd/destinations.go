@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -8,11 +9,13 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/infrahq/infra/api"
+	humanfmt "github.com/infrahq/infra/internal/format"
 	"github.com/infrahq/infra/internal/logging"
 )
 
 const (
 	DestinationStatusConnected    = "Connected"
+	DestinationStatusPending      = "Pending"
 	DestinationStatusDisconnected = "Disconnected"
 )
 
@@ -21,7 +24,7 @@ func newDestinationsCmd(cli *CLI) *cobra.Command {
 		Use:     "destinations",
 		Aliases: []string{"dst", "dest", "destination"},
 		Short:   "Manage destinations",
-		Group:   "Management commands:",
+		GroupID: groupManagement,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			if err := rootPreRun(cmd.Flags()); err != nil {
 				return err
@@ -49,8 +52,10 @@ func newDestinationsListCmd(cli *CLI) *cobra.Command {
 				return err
 			}
 
+			ctx := context.Background()
+
 			logging.Debugf("call server: list destinations")
-			destinations, err := listAll(client.ListDestinations, api.ListDestinationsRequest{})
+			destinations, err := listAll(ctx, client.ListDestinations, api.ListDestinationsRequest{})
 			if err != nil {
 				return err
 			}
@@ -71,6 +76,7 @@ func newDestinationsListCmd(cli *CLI) *cobra.Command {
 			default:
 				type row struct {
 					Name     string `header:"NAME"`
+					Kind     string `header:"KIND"`
 					URL      string `header:"URL"`
 					Status   string `header:"STATUS"`
 					LastSeen string `header:"LAST SEEN"`
@@ -78,16 +84,22 @@ func newDestinationsListCmd(cli *CLI) *cobra.Command {
 
 				var rows []row
 				for _, d := range destinations {
-					status := DestinationStatusDisconnected
-					if d.Connected {
+					var status string
+					switch {
+					case !d.Connected:
+						status = DestinationStatusDisconnected
+					case d.Connection.URL == "":
+						status = DestinationStatusPending
+					default:
 						status = DestinationStatusConnected
 					}
 
 					rows = append(rows, row{
 						Name:     d.Name,
+						Kind:     d.Kind,
 						URL:      d.Connection.URL,
 						Status:   status,
-						LastSeen: HumanTime(d.LastSeen.Time(), "never"),
+						LastSeen: humanfmt.HumanTime(d.LastSeen.Time(), "never"),
 					})
 				}
 				if len(rows) > 0 {
@@ -120,8 +132,10 @@ func newDestinationsRemoveCmd(cli *CLI) *cobra.Command {
 				return err
 			}
 
+			ctx := context.Background()
+
 			logging.Debugf("call server: list destinations named %q", name)
-			destinations, err := client.ListDestinations(api.ListDestinationsRequest{Name: name})
+			destinations, err := client.ListDestinations(ctx, api.ListDestinationsRequest{Name: name})
 			if err != nil {
 				if api.ErrorStatusCode(err) == 403 {
 					logging.Debugf("%s", err.Error())
@@ -139,7 +153,7 @@ func newDestinationsRemoveCmd(cli *CLI) *cobra.Command {
 			logging.Debugf("deleting %d destinations named %q...", destinations.Count, name)
 			for _, d := range destinations.Items {
 				logging.Debugf("...call server: delete destination %s", d.ID)
-				err := client.DeleteDestination(d.ID)
+				err := client.DeleteDestination(ctx, d.ID)
 				if err != nil {
 					if api.ErrorStatusCode(err) == 403 {
 						logging.Debugf("%s", err.Error())

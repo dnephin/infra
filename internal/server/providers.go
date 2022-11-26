@@ -12,16 +12,27 @@ import (
 	"github.com/infrahq/infra/api"
 	"github.com/infrahq/infra/internal"
 	"github.com/infrahq/infra/internal/access"
+	"github.com/infrahq/infra/internal/generate"
+	"github.com/infrahq/infra/internal/server/data"
 	"github.com/infrahq/infra/internal/server/models"
 )
 
 // caution: this endpoint is unauthenticated, do not return sensitive info
 func (a *API) ListProviders(c *gin.Context, r *api.ListProvidersRequest) (*api.ListResponse[api.Provider], error) {
-	exclude := []models.ProviderKind{models.ProviderKindInfra}
 	p := PaginationFromRequest(r.PaginationRequest)
-	providers, err := access.ListProviders(c, r.Name, exclude, &p)
+	opts := data.ListProvidersOptions{
+		ByName:               r.Name,
+		ExcludeInfraProvider: true,
+		Pagination:           &p,
+	}
+	providers, err := access.ListProviders(c, opts)
 	if err != nil {
 		return nil, err
+	}
+
+	// if social login is configured, also return that option
+	if a.server.Google != nil {
+		providers = append(providers, *a.server.Google)
 	}
 
 	result := api.NewListResponse(providers, PaginationToResponse(p), func(provider models.Provider) api.Provider {
@@ -75,6 +86,27 @@ func (a *API) CreateProvider(c *gin.Context, r *api.CreateProviderRequest) (*api
 	}
 	provider.Kind = kind
 
+	// If name is not provided, generate based on provider kind
+	if provider.Name == "" {
+		provider.Name = provider.Kind.String()
+
+		// If provider name is taken, generate a random tag
+		providers, err := access.ListProviders(c, data.ListProvidersOptions{
+			ByName: provider.Kind.String(),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("Error while generating name for provider: %w", err)
+		}
+		if len(providers) > 0 {
+			randomString, err := generate.CryptoRandom(6, generate.CharsetAlphaNumericNoVowels)
+			if err != nil {
+				return nil, fmt.Errorf("Error while generating name for provider: %w", err)
+			}
+
+			provider.Name = r.Kind + "-" + randomString
+		}
+	}
+
 	if err := a.setProviderInfoFromServer(c, provider); err != nil {
 		return nil, err
 	}
@@ -83,6 +115,23 @@ func (a *API) CreateProvider(c *gin.Context, r *api.CreateProviderRequest) (*api
 		return nil, err
 	}
 
+	return provider.ToAPI(), nil
+}
+
+func (a *API) PatchProvider(c *gin.Context, r *api.PatchProviderRequest) (*api.Provider, error) {
+	provider, err := access.GetProvider(c, r.ID)
+	if err != nil {
+		return nil, err
+	}
+	if r.Name != "" {
+		provider.Name = r.Name
+	}
+	if r.ClientSecret != "" {
+		provider.ClientSecret = models.EncryptedAtRest(r.ClientSecret)
+	}
+	if err = access.SaveProvider(c, provider); err != nil {
+		return nil, err
+	}
 	return provider.ToAPI(), nil
 }
 
@@ -128,7 +177,7 @@ func (a *API) DeleteProvider(c *gin.Context, r *api.Resource) (*api.EmptyRespons
 // setProviderInfoFromServer checks information provided by an OIDC server
 func (a *API) setProviderInfoFromServer(c *gin.Context, provider *models.Provider) error {
 	// create a provider client to validate the server and get its info
-	oidc, err := a.providerClient(c, provider, "http://localhost:8301")
+	oidc, err := a.providerClient(c, provider, "")
 	if err != nil {
 		return fmt.Errorf("%w: %s", internal.ErrBadRequest, err)
 	}

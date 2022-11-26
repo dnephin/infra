@@ -16,52 +16,52 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/infrahq/secrets"
 	"github.com/jessevdk/go-flags"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	rest "k8s.io/client-go/rest"
+	"k8s.io/client-go/rest"
 
 	"github.com/infrahq/infra/internal/logging"
 )
 
-const (
-	podLabelsFilePath = "/etc/podinfo/labels"
-	namespaceFilePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-	caFilePath        = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-)
-
+// Kubernetes provides access to the kubernetes API.
 type Kubernetes struct {
-	Config       *rest.Config
-	SecretReader secrets.SecretStorage
+	Config *rest.Config
 }
 
-func NewKubernetes() (*Kubernetes, error) {
-	k := &Kubernetes{}
+func NewKubernetes(authToken, addr, ca string) (*Kubernetes, error) {
+	if authToken != "" && addr != "" && ca != "" {
+		k := &Kubernetes{Config: &rest.Config{}}
+		k.Config.Host = addr
+		k.Config.TLSClientConfig.CAData = []byte(ca)
+		k.Config.BearerToken = authToken
+		return k, nil
+	}
 
 	config, err := rest.InClusterConfig()
-	if err != nil {
-		return k, err
-	}
-
-	k.Config = config
-
-	namespace, err := Namespace()
-	if err != nil {
-		return k, err
-	}
-
-	clientset, err := kubernetes.NewForConfig(k.Config)
 	if err != nil {
 		return nil, err
 	}
 
-	k.SecretReader = secrets.NewKubernetesSecretProvider(clientset, namespace)
+	if err := rest.LoadTLSFiles(config); err != nil {
+		return nil, fmt.Errorf("load TLS files: %w", err)
+	}
 
-	return k, err
+	if authToken != "" {
+		config.BearerToken = authToken
+	}
+	if addr != "" {
+		config.Host = addr
+	}
+	if ca != "" {
+		config.CAData = []byte(ca)
+	}
+
+	k := &Kubernetes{Config: config}
+	return k, nil
 }
 
 // namespaceRole is used as a tuple to pair namespaces and grants as a map key
@@ -93,7 +93,7 @@ func (k *Kubernetes) UpdateClusterRoleBindings(subjects map[string][]rbacv1.Subj
 
 	for cr, subjs := range subjects {
 		if !validClusterRoles[cr] {
-			logging.Warnf("cluster role binding %s skipped, it does not exist", cr)
+			logging.Warnf("skipping bindings for cluster role %s that does not exist", cr)
 			continue
 		}
 
@@ -113,7 +113,9 @@ func (k *Kubernetes) UpdateClusterRoleBindings(subjects map[string][]rbacv1.Subj
 		})
 	}
 
-	existingInfraCrbs, err := clientset.RbacV1().ClusterRoleBindings().List(context.Background(), metav1.ListOptions{LabelSelector: "app.kubernetes.io/managed-by=infra"})
+	existingInfraCrbs, err := clientset.RbacV1().ClusterRoleBindings().List(
+		context.Background(),
+		metav1.ListOptions{LabelSelector: "app.kubernetes.io/managed-by=infra"})
 	if err != nil {
 		return err
 	}
@@ -194,7 +196,9 @@ func (k *Kubernetes) UpdateRoleBindings(subjects map[ClusterRoleNamespace][]rbac
 		})
 	}
 
-	existingInfraRbs, err := clientset.RbacV1().RoleBindings("").List(context.TODO(), metav1.ListOptions{LabelSelector: "app.kubernetes.io/managed-by=infra"})
+	existingInfraRbs, err := clientset.RbacV1().RoleBindings("").List(
+		context.TODO(),
+		metav1.ListOptions{LabelSelector: "app.kubernetes.io/managed-by=infra"})
 	if err != nil {
 		return err
 	}
@@ -461,16 +465,13 @@ func (k *Kubernetes) kubeControllerManagerClusterName() (string, error) {
 	return opts.ClusterName, nil
 }
 
-func (k *Kubernetes) Checksum() (string, error) {
-	ca, err := CA()
-	if err != nil {
-		return "", err
-	}
-
+// Checksum returns a sha256 hash of the PEM encoded CA certificate used for
+// TLS by this kubernetes cluster.
+func (k *Kubernetes) Checksum() string {
 	h := sha256.New()
-	h.Write(ca)
+	h.Write(k.Config.CAData)
 	hash := h.Sum(nil)
-	return hex.EncodeToString(hash), nil
+	return hex.EncodeToString(hash)
 }
 
 func (k *Kubernetes) Name(chksm string) (string, error) {
@@ -501,6 +502,8 @@ func (k *Kubernetes) Name(chksm string) (string, error) {
 	return name, nil
 }
 
+const podLabelsFilePath = "/etc/podinfo/labels"
+
 func PodLabels() ([]string, error) {
 	contents, err := ioutil.ReadFile(podLabelsFilePath)
 	if err != nil {
@@ -528,54 +531,92 @@ func InstancePodLabels() ([]string, error) {
 	return instanceLabels, nil
 }
 
-func Namespace() (string, error) {
+const namespaceFilePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+func readNamespaceFromInClusterFile() (string, error) {
 	contents, err := ioutil.ReadFile(namespaceFilePath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read namespace file: %w", err)
 	}
 
 	return string(contents), nil
 }
 
-func CA() ([]byte, error) {
-	contents, err := ioutil.ReadFile(caFilePath)
-	if err != nil {
-		return nil, err
-	}
-
-	return contents, nil
-}
-
-// Find the first suitable Service, filtering on infrahq.com/component
-func (k *Kubernetes) Service(component string, labels ...string) (*corev1.Service, error) {
+// Find the first suitable Service, filtering on app.infrahq.com/component
+func (k *Kubernetes) Service(labels ...string) (*corev1.Service, error) {
 	clientset, err := kubernetes.NewForConfig(k.Config)
 	if err != nil {
 		return nil, err
 	}
 
-	namespace, err := Namespace()
+	namespace, err := readNamespaceFromInClusterFile()
 	if err != nil {
 		return nil, err
 	}
 
-	selector := []string{
-		fmt.Sprintf("app.infrahq.com/component=%s", component),
-	}
-
-	selector = append(selector, labels...)
-
 	services, err := clientset.CoreV1().Services(namespace).List(context.Background(), metav1.ListOptions{
-		LabelSelector: strings.Join(selector, ","),
+		// TODO: this should use configurable label selectors instead of using pod labels or static labels
+		LabelSelector: strings.Join(append(labels, "app.infrahq.com/component=connector"), ","),
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	if len(services.Items) == 0 {
-		return nil, fmt.Errorf("no service found for component %s", component)
+		return nil, fmt.Errorf("no service found for labels %v", labels)
 	}
 
 	return &services.Items[0], nil
+}
+
+func (k *Kubernetes) Nodes() ([]corev1.Node, error) {
+	clientset, err := kubernetes.NewForConfig(k.Config)
+	if err != nil {
+		return nil, err
+	}
+
+	nodes, err := clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	return nodes.Items, nil
+}
+
+func (k *Kubernetes) NodePort(service *corev1.Service, servicePort *corev1.ServicePort) (string, int, error) {
+	if len(service.Spec.Ports) == 0 {
+		return "", -1, fmt.Errorf("service has no ports")
+	}
+
+	nodes, err := k.Nodes()
+	if err != nil {
+		return "", -1, err
+	}
+
+	nodeIP := ""
+	for _, node := range nodes {
+		for _, address := range node.Status.Addresses {
+			switch address.Type {
+			case corev1.NodeExternalDNS, corev1.NodeExternalIP:
+				logging.Debugf("using external node address %s", nodeIP)
+				return address.Address, int(servicePort.NodePort), nil
+			case corev1.NodeInternalDNS, corev1.NodeInternalIP:
+				// no need to set nodeIP more than once
+				if nodeIP == "" {
+					nodeIP = address.Address
+				}
+			case corev1.NodeHostName:
+				// noop
+			}
+		}
+	}
+
+	if nodeIP == "" {
+		return "", -1, fmt.Errorf("no node addresses found")
+	}
+
+	logging.Debugf("using internal node address %s", nodeIP)
+	return nodeIP, int(servicePort.NodePort), nil
 }
 
 // Find a suitable Endpoint to use by inspecting Service objects
@@ -585,9 +626,21 @@ func (k *Kubernetes) Endpoint() (string, int, error) {
 		return "", -1, err
 	}
 
-	service, err := k.Service("connector", labels...)
+	service, err := k.Service(labels...)
 	if err != nil {
 		return "", -1, err
+	}
+
+	var servicePort *corev1.ServicePort
+	for i, port := range service.Spec.Ports {
+		if port.Name == "https" {
+			servicePort = &service.Spec.Ports[i]
+			break
+		}
+	}
+
+	if servicePort == nil {
+		return "", -1, fmt.Errorf("service does not have an https port")
 	}
 
 	var host string
@@ -597,10 +650,10 @@ func (k *Kubernetes) Endpoint() (string, int, error) {
 	case corev1.ServiceTypeClusterIP:
 		host = service.Spec.ClusterIP
 	case corev1.ServiceTypeNodePort:
-		fallthrough
+		return k.NodePort(service, servicePort)
 	case corev1.ServiceTypeLoadBalancer:
 		if len(service.Status.LoadBalancer.Ingress) == 0 {
-			return "", -1, fmt.Errorf("load balancer has no ingress objects")
+			return "", -1, fmt.Errorf("no address available for load balancer, it may still be provisioning")
 		}
 
 		ingress := service.Status.LoadBalancer.Ingress[0]
@@ -609,15 +662,12 @@ func (k *Kubernetes) Endpoint() (string, int, error) {
 		if host == "" {
 			host = ingress.IP
 		}
+
 	default:
 		return "", -1, fmt.Errorf("unsupported service type")
 	}
 
-	if len(service.Spec.Ports) == 0 {
-		return "", -1, fmt.Errorf("service has no ports")
-	}
-
-	return host, int(service.Spec.Ports[0].Port), nil
+	return host, int(servicePort.Port), nil
 }
 
 func (k *Kubernetes) IsServiceTypeClusterIP() (bool, error) {
@@ -625,7 +675,7 @@ func (k *Kubernetes) IsServiceTypeClusterIP() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	service, err := k.Service("connector", labels...)
+	service, err := k.Service(labels...)
 	if err != nil {
 		return false, err
 	}

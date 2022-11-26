@@ -7,73 +7,69 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	survey "github.com/AlecAivazis/survey/v2"
 	"github.com/AlecAivazis/survey/v2/terminal"
+	"github.com/Masterminds/semver/v3"
 	"github.com/cli/browser"
-	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/goware/urlx"
 	"github.com/muesli/termenv"
 	"github.com/spf13/cobra"
 
 	"github.com/infrahq/infra/api"
 	"github.com/infrahq/infra/internal/certs"
+	"github.com/infrahq/infra/internal/cmd/cliopts"
 	"github.com/infrahq/infra/internal/cmd/types"
-	"github.com/infrahq/infra/internal/generate"
+	"github.com/infrahq/infra/internal/format"
 	"github.com/infrahq/infra/internal/logging"
 )
 
 type loginCmdOptions struct {
 	Server             string
 	AccessKey          string
-	Provider           string
 	SkipTLSVerify      bool
 	TrustedCertificate string
 	TrustedFingerprint string
 	NonInteractive     bool
 	NoAgent            bool
+	User               string
+	Password           string
 }
 
-type loginMethod int8
-
-const (
-	localLogin loginMethod = iota
-	oidcLogin
-)
-
-const cliLoginRedirectURL = "http://localhost:8301"
+const DeviceFlowMinVersion = "0.16.0"
 
 func newLoginCmd(cli *CLI) *cobra.Command {
 	var options loginCmdOptions
 
 	cmd := &cobra.Command{
-		Use:   "login [SERVER]",
-		Short: "Login to Infra",
-		Long:  "Login to Infra and start a background agent to keep local configuration up-to-date",
-		Example: `# By default, login will prompt for all required information.
-$ infra login
+		Use:     "login [SERVER]",
+		Short:   "Login to Infra",
+		Args:    MaxArgs(1),
+		GroupID: groupCore,
+		Example: `# Login
+infra login example.infrahq.com
 
-# Login to a specific server
-$ infra login infraexampleserver.com
+# Login with username and password (prompt for password)
+infra login example.infrahq.com --user user@example.com
 
-# Login with a specific identity provider
-$ infra login --provider okta
+# Login with access key
+export INFRA_SERVER=example.infrahq.com
+export INFRA_ACCESS_KEY=2vrEbqFEUr.jtTlxkgYdvghJNdEa8YoUxN0
+infra login example.infrahq.com
 
-# Login with an access key
-$ export INFRA_ACCESS_KEY=1M4CWy9wF5.fAKeKEy5sMLH9ZZzAur0ZIjy
-$ infra login
-
-# Login with pre-set provider and server
-$ export INFRA_SERVER=example.infrahq.com
-$ export INFRA_PROVIDER=google
-$ infra login`,
-		Args:  MaxArgs(1),
-		Group: "Core commands:",
+# Login with username and password
+export INFRA_SERVER=example.infrahq.com
+export INFRA_USER=user@example.com
+export INFRA_PASSWORD=p4ssw0rd
+infra login`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := cliopts.DefaultsFromEnv("INFRA", cmd.Flags()); err != nil {
+				return err
+			}
+			// There is no flag for server, so we check it separately
 			if server, ok := os.LookupEnv("INFRA_SERVER"); ok {
 				options.Server = server
 			}
@@ -82,12 +78,20 @@ $ infra login`,
 				options.Server = args[0]
 			}
 
+			if password, ok := os.LookupEnv("INFRA_PASSWORD"); ok {
+				options.Password = password
+			}
+
+			if options.AccessKey == "" {
+				options.AccessKey = os.Getenv("INFRA_ACCESS_KEY")
+			}
+
 			return login(cli, options)
 		},
 	}
 
 	cmd.Flags().StringVar(&options.AccessKey, "key", "", "Login with an access key")
-	cmd.Flags().StringVar(&options.Provider, "provider", "", "Login with an identity provider")
+	cmd.Flags().StringVar(&options.User, "user", "", "User email")
 	cmd.Flags().BoolVar(&options.SkipTLSVerify, "skip-tls-verify", false, "Skip verifying server TLS certificates")
 	cmd.Flags().Var((*types.StringOrFile)(&options.TrustedCertificate), "tls-trusted-cert", "TLS certificate or CA used by the server")
 	cmd.Flags().StringVar(&options.TrustedFingerprint, "tls-trusted-fingerprint", "", "SHA256 fingerprint of the server TLS certificate")
@@ -97,6 +101,7 @@ $ infra login`,
 }
 
 func login(cli *CLI, options loginCmdOptions) error {
+	ctx := context.Background()
 	config, err := readConfig()
 	if err != nil {
 		return err
@@ -104,17 +109,17 @@ func login(cli *CLI, options loginCmdOptions) error {
 
 	if options.Server == "" {
 		if options.NonInteractive {
-			return Error{Message: "Non-interactive login requires the [SERVER] argument or environment variable INFRA_SERVER to be set"}
+			return Error{Message: "Non-interactive login requires the [SERVER] argument or the INFRA_SERVER environment variable to be set"}
 		}
-		if len(config.Hosts) == 1 {
-			options.Server = config.Hosts[0].Host
-		} else {
-			options.Server, err = promptServer(cli, config)
-			if err != nil {
-				return err
-			}
+
+		options.Server, err = promptServer(cli, config)
+		if err != nil {
+			return err
 		}
 	}
+
+	options.Server = strings.TrimPrefix(options.Server, "https://")
+	options.Server = strings.TrimPrefix(options.Server, "http://")
 
 	if len(options.TrustedCertificate) == 0 {
 		// Attempt to find a previously trusted certificate
@@ -132,52 +137,74 @@ func login(cli *CLI, options loginCmdOptions) error {
 
 	loginReq := &api.LoginRequest{}
 
-	if options.AccessKey == "" {
-		options.AccessKey = os.Getenv("INFRA_ACCESS_KEY")
-	}
-
 	switch {
 	case options.AccessKey != "":
 		loginReq.AccessKey = options.AccessKey
-	case options.Provider != "":
-		if options.NonInteractive {
-			return Error{Message: "Non-interactive login only supports access keys, set the INFRA_ACCESS_KEY environment variable and try again"}
+	case options.User != "":
+		if options.Password == "" {
+			if options.NonInteractive {
+				return Error{Message: "Non-interactive login requires setting the INFRA_PASSWORD environment variable"}
+			}
+
+			if err := survey.AskOne(&survey.Password{Message: "Password:"}, &options.Password, cli.surveyIO); err != nil {
+				return err
+			}
 		}
 
-		if options.Provider == "infra" {
-			loginReq.PasswordCredentials, err = promptLocalLogin(cli)
-			if err != nil {
-				return err
-			}
-		} else {
-			loginReq.OIDC, err = loginToProviderN(lc.APIClient, options.Provider)
-			if err != nil {
-				return err
-			}
+		loginReq.PasswordCredentials = &api.LoginRequestPasswordCredentials{
+			Name:     options.User,
+			Password: options.Password,
 		}
+
 	default:
 		if options.NonInteractive {
-			return Error{Message: "Non-interactive login only supports access keys, set the INFRA_ACCESS_KEY environment variable and try again"}
+			return Error{Message: "Non-interactive login requires setting either the INFRA_ACCESS_KEY or both the INFRA_USER and INFRA_PASSWORD environment variables"}
 		}
-		loginMethod, provider, err := promptLoginOptions(cli, lc.APIClient)
+
+		if err = checkDeviceFlowCompatibility(ctx, lc.APIClient); err != nil {
+			return err
+		}
+
+		resp, err := deviceFlowLogin(ctx, lc.APIClient, cli)
 		if err != nil {
 			return err
 		}
 
-		switch loginMethod {
-		case localLogin:
-			loginReq.PasswordCredentials, err = promptLocalLogin(cli)
-			if err != nil {
-				return err
-			}
-		case oidcLogin:
-			loginReq.OIDC, err = loginToProvider(provider)
-			if err != nil {
-				return err
-			}
+		loginReq.AccessKey = resp.AccessKey
+		err = updateInfraConfig(lc, loginReq, resp)
+		if err != nil {
+			return err
 		}
 	}
+
 	return loginToInfra(cli, lc, loginReq, options.NoAgent)
+}
+
+func checkDeviceFlowCompatibility(ctx context.Context, api *api.Client) error {
+	version, err := api.GetServerVersion(ctx)
+	if err != nil {
+		return err
+	}
+
+	// append -0 to compare against "prerelease" versions
+	// see https://pkg.go.dev/github.com/Masterminds/semver/v3#hdr-Checking_Version_Constraints_and_Comparing_Versions
+	c, err := semver.NewConstraint(fmt.Sprintf(">= %s-0", DeviceFlowMinVersion))
+	if err != nil {
+		return err
+	}
+
+	v, err := semver.NewVersion(version.Version)
+	if err != nil {
+		return err
+	}
+
+	if !c.Check(v) {
+		return Error{
+			Message: fmt.Sprintf("Your version of Infra Server (%s) is out of date. Please upgrade to %s or later.", v, DeviceFlowMinVersion),
+		}
+	}
+
+	return nil
 }
 
 func equalHosts(x, y string) bool {
@@ -191,17 +218,13 @@ func equalHosts(x, y string) bool {
 }
 
 func loginToInfra(cli *CLI, lc loginClient, loginReq *api.LoginRequest, noAgent bool) error {
-	loginRes, err := lc.APIClient.Login(loginReq)
+	ctx := context.TODO()
+	loginRes, err := lc.APIClient.Login(ctx, loginReq)
 	if err != nil {
-		logging.Debugf("login: %s", err)
 		if api.ErrorStatusCode(err) == http.StatusUnauthorized || api.ErrorStatusCode(err) == http.StatusNotFound {
 			switch {
-			case loginReq.AccessKey != "":
-				return &LoginError{Message: "your access key may be invalid"}
 			case loginReq.PasswordCredentials != nil:
 				return &LoginError{Message: "your username or password may be invalid"}
-			case loginReq.OIDC != nil:
-				return &LoginError{Message: "please contact an administrator and check identity provider configurations"}
 			}
 		}
 
@@ -220,7 +243,11 @@ func loginToInfra(cli *CLI, lc loginClient, loginReq *api.LoginRequest, noAgent 
 		}
 
 		logging.Debugf("call server: update user %s", loginRes.UserID)
-		if _, err := lc.APIClient.UpdateUser(&api.UpdateUserRequest{ID: loginRes.UserID, Password: password}); err != nil {
+		if _, err := lc.APIClient.UpdateUser(ctx, &api.UpdateUserRequest{
+			ID:          loginRes.UserID,
+			Password:    password,
+			OldPassword: loginReq.PasswordCredentials.Password,
+		}); err != nil {
 			if passwordError(cli, err) {
 				goto PROMPTLOGIN
 			}
@@ -275,10 +302,6 @@ func updateInfraConfig(lc loginClient, loginReq *api.LoginRequest, loginRes *api
 		clientHostConfig.TrustedCertificate = lc.TrustedCertificate
 	}
 
-	if loginReq.OIDC != nil {
-		clientHostConfig.ProviderID = loginReq.OIDC.ProviderID
-	}
-
 	u, err := urlx.Parse(lc.APIClient.URL)
 	if err != nil {
 		return err
@@ -290,66 +313,6 @@ func updateInfraConfig(lc loginClient, loginReq *api.LoginRequest, loginRes *api
 	}
 
 	return nil
-}
-
-func oidcflow(provider *api.Provider) (string, error) {
-	// the state makes sure we are getting the correct response for our request
-	state, err := generate.CryptoRandom(12, generate.CharsetAlphaNumeric)
-	if err != nil {
-		return "", err
-	}
-
-	// the local server receives the response from the identity provider and sends it along to the infra server
-	ls, err := newLocalServer()
-	if err != nil {
-		return "", err
-	}
-
-	url, err := authURLForProvider(*provider, state)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse provider URL: %w", err)
-	}
-
-	err = browser.OpenURL(url)
-	if err != nil {
-		return "", err
-	}
-
-	code, recvstate, err := ls.wait(time.Minute * 5)
-	if err != nil {
-		return "", err
-	}
-
-	if state != recvstate {
-		return "", Error{Message: "Login aborted, provider state did not match the expected state"}
-	}
-
-	return code, nil
-}
-
-// Given the provider name, directs user to its OIDC login page, then saves the auth code (to later login to infra)
-func loginToProviderN(client *api.Client, providerName string) (*api.LoginRequestOIDC, error) {
-	provider, err := GetProviderByName(client, providerName)
-	if err != nil {
-		return nil, err
-	}
-	return loginToProvider(provider)
-}
-
-// Given the provider, directs user to its OIDC login page, then saves the auth code (to later login to infra)
-func loginToProvider(provider *api.Provider) (*api.LoginRequestOIDC, error) {
-	fmt.Fprintf(os.Stderr, "  Logging in with %s...\n", termenv.String(provider.Name).Bold().String())
-
-	code, err := oidcflow(provider)
-	if err != nil {
-		return nil, err
-	}
-
-	return &api.LoginRequestOIDC{
-		ProviderID:  provider.ID,
-		RedirectURL: cliLoginRedirectURL,
-		Code:        code,
-	}, nil
 }
 
 type loginClient struct {
@@ -487,81 +450,65 @@ func attemptTLSRequest(options loginCmdOptions) error {
 	return err
 }
 
-func promptLocalLogin(cli *CLI) (*api.LoginRequestPasswordCredentials, error) {
-	var credentials struct {
-		Username string
-		Password string
-	}
+const spinChars = `\|/-`
 
-	questionPrompt := []*survey.Question{
-		{
-			Name:     "Username",
-			Prompt:   &survey.Input{Message: "Username:"},
-			Validate: survey.Required,
-		},
-		{
-			Name:     "Password",
-			Prompt:   &survey.Password{Message: "Password:"},
-			Validate: survey.Required,
-		},
-	}
-
-	if err := survey.Ask(questionPrompt, &credentials, cli.surveyIO); err != nil {
-		return &api.LoginRequestPasswordCredentials{}, err
-	}
-
-	return &api.LoginRequestPasswordCredentials{
-		Name:     credentials.Username,
-		Password: credentials.Password,
-	}, nil
-}
-
-func listProviders(client *api.Client) ([]api.Provider, error) {
-	logging.Debugf("call server: list providers")
-	providers, err := client.ListProviders(api.ListProvidersRequest{})
+func deviceFlowLogin(ctx context.Context, client *api.Client, cli *CLI) (*api.LoginResponse, error) {
+	resp, err := client.StartDeviceFlow(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	return providers.Items, nil
-}
+	url := resp.VerificationURI + "?code=" + resp.UserCode
 
-func promptLoginOptions(cli *CLI, client *api.Client) (loginMethod loginMethod, provider *api.Provider, err error) {
-	providers, err := listProviders(client)
-	if err != nil {
-		return 0, nil, err
-	}
+	// display to user
+	cli.Output("Navigate to " + url + " and verify your code:\n")
+	cli.Output("\t\t" + resp.UserCode + "\n")
 
-	if len(providers) == 0 {
-		return localLogin, nil, nil
-	}
+	// we don't care if this fails. some devices won't be able to open the browser
+	_ = browser.OpenURL(url)
 
-	var options []string
-	for _, p := range providers {
-		options = append(options, fmt.Sprintf("%s (%s)", p.Name, p.URL))
-	}
+	// poll for response
+	timeout := time.NewTimer(time.Duration(resp.ExpiresInSeconds) * time.Second)
+	defer timeout.Stop()
+	poll := time.NewTicker(time.Duration(resp.PollIntervalSeconds) * time.Second)
+	defer poll.Stop()
+	spinner := time.NewTicker(1000 * time.Millisecond)
+	defer spinner.Stop()
 
-	options = append(options, "Login with username and password")
+	var spinnerCount int = 0
 
-	var i int
-	selectPrompt := &survey.Select{
-		Message: "Select a login method:",
-		Options: options,
+	for {
+		select {
+		case <-spinner.C:
+			spinnerCount++
+			fmt.Printf("  %s\r", string(spinChars[spinnerCount%len(spinChars)]))
+		case <-timeout.C:
+			// too late. return an error
+			return nil, api.ErrDeviceLoginTimeout
+		case <-poll.C:
+			// check to see if user is authed yet
+			pollResp, err := client.GetDeviceFlowStatus(ctx, &api.DeviceFlowStatusRequest{DeviceCode: resp.DeviceCode})
+			if err != nil {
+				return nil, err
+			}
+			switch pollResp.Status {
+			case "rejected":
+				return nil, Error{Message: "device approval request rejected"}
+			case "expired":
+				return nil, Error{Message: "device approval request expired"}
+			case "confirmed":
+				return pollResp.LoginResponse, nil // success!
+			case "pending": // wait more
+			default:
+				logging.Warnf("unexpected response status: " + pollResp.Status)
+			}
+		}
 	}
-	err = survey.AskOne(selectPrompt, &i, cli.surveyIO)
-	if errors.Is(err, terminal.InterruptErr) {
-		return 0, nil, err
-	}
-
-	if i == len(options)-1 {
-		return localLogin, nil, nil
-	}
-	return oidcLogin, &providers[i], nil
 }
 
 func promptVerifyTLSCert(cli *CLI, cert *x509.Certificate) error {
 	formatTime := func(t time.Time) string {
-		return fmt.Sprintf("%v (%v)", HumanTime(t, "none"), t.Format(time.RFC1123))
+		return fmt.Sprintf("%v (%v)", format.HumanTime(t, "none"), t.Format(time.RFC1123))
 	}
 	title := "Certificate"
 	if cert.IsCA {
@@ -642,7 +589,7 @@ func promptNewServer(cli *CLI) (string, error) {
 		cli.surveyIO,
 		survey.WithValidator(survey.Required),
 	)
-	return server, err
+	return strings.TrimSpace(server), err
 }
 
 func promptServerList(cli *CLI, servers []ClientHostConfig) (string, error) {
@@ -673,71 +620,4 @@ func promptServerList(cli *CLI, servers []ClientHostConfig) (string, error) {
 	}
 
 	return servers[i].Host, nil
-}
-
-// authURLForProvider builds an authorization URL that will get the information we need from an identity provider
-func authURLForProvider(provider api.Provider, state string) (string, error) {
-	// build the authorization query parameters based on attributes of the provider
-	params := url.Values{}
-	params.Add("redirect_uri", "http://localhost:8301") // where to send the access codes after the user logs in with an IDP
-	if provider.Kind == "google" {
-		params.Add("prompt", "consent")      // google only sends a refresh token when a user consents, always prompt so we always get the ref token
-		params.Add("access_type", "offline") // specifies that we want a refresh token
-	}
-	params.Add("client_id", provider.ClientID)
-	params.Add("response_type", "code")
-	params.Add("state", state)
-
-	authURL := provider.AuthURL
-	scopes := provider.Scopes
-
-	if authURL == "" {
-		// this is an old server that doesn't populate the auth URL
-		// we can get it ourselves, along with the scopes
-		var err error
-		authURL, scopes, err = getProviderConfig(provider)
-		if err != nil {
-			return "", err
-		}
-
-	}
-
-	params.Add("scope", strings.Join(scopes, " "))
-
-	return fmt.Sprintf("%s?%s", authURL, params.Encode()), nil
-}
-
-// getProviderConfig reads info about the OIDC provider from the .well-known/openid-configuration
-// this is used for backwards compatibility with infra server earlier than 0.13.6
-func getProviderConfig(provider api.Provider) (string, []string, error) {
-	// find out what the authorization endpoint is
-	providerClient, err := oidc.NewProvider(context.Background(), fmt.Sprintf("https://%s", provider.URL))
-	if err != nil {
-		return "", []string{}, fmt.Errorf("get provider client: %w", err)
-	}
-
-	// claims are the attributes of the user we want to know from the identity provider
-	var claims struct {
-		ScopesSupported []string `json:"scopes_supported"`
-	}
-
-	if err := providerClient.Claims(&claims); err != nil {
-		return "", []string{}, fmt.Errorf("parsing claims: %w", err)
-	}
-
-	scopes := []string{"openid", "email"} // openid and email are required scopes for login to work
-
-	// we want to be able to use these scopes to access groups, but they are not needed
-	wantScope := map[string]bool{
-		"groups":         true,
-		"offline_access": true,
-	}
-
-	for _, scope := range claims.ScopesSupported {
-		if wantScope[scope] {
-			scopes = append(scopes, scope)
-		}
-	}
-
-	return providerClient.Endpoint().AuthURL, scopes, nil
 }

@@ -31,8 +31,9 @@ func Signup(c *gin.Context, keyExpiresAt time.Time, baseDomain string, details S
 		return nil, "", fmt.Errorf("create org on sign-up: %w", err)
 	}
 
-	db = data.NewTransaction(db.GormDB(), details.Org.ID)
+	db = db.WithOrgID(details.Org.ID)
 	rCtx.DBTxn = db
+	rCtx.Authenticated.Organization = details.Org
 	c.Set(RequestContextKey, rCtx)
 
 	identity := &models.Identity{
@@ -48,7 +49,7 @@ func Signup(c *gin.Context, keyExpiresAt time.Time, baseDomain string, details S
 		return nil, "", fmt.Errorf("hash password on sign-up: %w", err)
 	}
 
-	_, err = CreateProviderUser(c, InfraProvider(c), identity)
+	_, err = data.CreateProviderUser(db, data.InfraProvider(db), identity)
 	if err != nil {
 		return nil, "", fmt.Errorf("create provider user on sign-up: %w", err)
 	}
@@ -74,10 +75,11 @@ func Signup(c *gin.Context, keyExpiresAt time.Time, baseDomain string, details S
 
 	// grant the user a session on initial sign-up
 	accessKey := &models.AccessKey{
-		IssuedFor:         identity.ID,
-		IssuedForIdentity: identity,
-		ProviderID:        data.InfraProvider(db).ID,
-		ExpiresAt:         keyExpiresAt,
+		IssuedFor:     identity.ID,
+		IssuedForName: identity.Name,
+		ProviderID:    data.InfraProvider(db).ID,
+		ExpiresAt:     keyExpiresAt,
+		Scopes:        []string{models.ScopeAllowCreateAccessKey},
 	}
 
 	bearer, err := data.CreateAccessKey(db, accessKey)

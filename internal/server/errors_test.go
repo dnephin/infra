@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -20,8 +21,9 @@ import (
 
 func TestSendAPIError(t *testing.T) {
 	tests := []struct {
-		err    error
-		result api.Error
+		err               error
+		result            api.Error
+		emptyResponseBody bool
 	}{
 		{
 			err:    internal.ErrBadRequest,
@@ -57,8 +59,8 @@ func TestSendAPIError(t *testing.T) {
 			result: api.Error{Code: http.StatusUnauthorized, Message: "unauthorized: " + data.ErrAccessKeyExpired.Error()},
 		},
 		{
-			err:    data.ErrAccessKeyDeadlineExceeded,
-			result: api.Error{Code: http.StatusUnauthorized, Message: "unauthorized: " + data.ErrAccessKeyDeadlineExceeded.Error()},
+			err:    data.ErrAccessInactivityTimeout,
+			result: api.Error{Code: http.StatusUnauthorized, Message: "unauthorized: " + data.ErrAccessInactivityTimeout.Error()},
 		},
 		{
 			err: access.AuthorizationError{
@@ -80,13 +82,49 @@ func TestSendAPIError(t *testing.T) {
 			result: api.Error{Code: http.StatusNotImplemented, Message: "not implemented"},
 		},
 		{
-			err: data.UniqueConstraintError{Table: "user", Column: "name"},
+			err: fmt.Errorf("with context: %w",
+				data.UniqueConstraintError{Table: "user", Column: "name"}),
 			result: api.Error{
 				Code:    http.StatusConflict,
-				Message: "a user with that name already exists",
+				Message: "with context: a user with that name already exists",
 				FieldErrors: []api.FieldError{
 					{FieldName: "name", Errors: []string{"a user with that name already exists"}},
 				},
+			},
+		},
+		{
+			err: api.Error{
+				Code:    http.StatusLocked,
+				Message: "it's locked",
+				FieldErrors: []api.FieldError{
+					{FieldName: "first", Errors: []string{"at max callers"}},
+				},
+			},
+			result: api.Error{
+				Code:    http.StatusLocked,
+				Message: "it's locked",
+				FieldErrors: []api.FieldError{
+					{FieldName: "first", Errors: []string{"at max callers"}},
+				},
+			},
+		},
+		{
+			err:               internal.ErrNotModified,
+			result:            api.Error{Code: http.StatusNotModified},
+			emptyResponseBody: true,
+		},
+		{
+			err: fmt.Errorf("wrapped: %w", context.DeadlineExceeded),
+			result: api.Error{
+				Code:    http.StatusGatewayTimeout,
+				Message: "request timed out",
+			},
+		},
+		{
+			err: fmt.Errorf("wrapped: %w", context.Canceled),
+			result: api.Error{
+				Code:    499,
+				Message: "client closed the request: wrapped: context canceled",
 			},
 		},
 	}
@@ -104,6 +142,12 @@ func TestSendAPIError(t *testing.T) {
 			sendAPIError(c, test.err)
 
 			assert.Equal(t, test.result.Code, int32(resp.Result().StatusCode))
+
+			if test.emptyResponseBody {
+				assert.Equal(t, resp.Body.Len(), 0)
+				return
+			}
+
 			actual := &api.Error{}
 			err := json.NewDecoder(resp.Body).Decode(actual)
 			assert.NilError(t, err)

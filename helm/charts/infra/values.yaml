@@ -443,7 +443,7 @@ server:
     # sessionDuration: 720h0m0s # 30 days
 
     ## How frequently a user must use session for it to remain active
-    # sessionExtensionDeadline: 72h0m0s # once every 3 days
+    # sessionInactivityTimeout: 72h0m0s # once every 3 days
 
     ## Additional secret providers to configure
     secrets: []
@@ -780,6 +780,14 @@ connector:
   ## No effect unless `autoscaling.enabled` is `false`
   replicas: 1
 
+  ## Create default cluster roles to assign with Infra
+  defaultRoles:
+    create: true
+    roles:
+      exec: true
+      logs: true
+      portForward: true
+
   ## Infra connector image configurations
   image:
     ## The image repository to use for the connector deployment
@@ -909,7 +917,7 @@ connector:
     annotations: {}
 
     ## HTTP service port
-    port: 80
+    port: 8080
 
     ## HTTP service port name
     portName: http
@@ -1053,6 +1061,7 @@ connector:
 
     ## Connector container service ports
     addr:
+      http: 9080
       https: 9443
       metrics: 9091
 
