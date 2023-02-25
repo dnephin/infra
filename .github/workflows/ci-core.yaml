@@ -2,8 +2,6 @@ name: ci / core
 
 on:
   push: {}
-  schedule:
-    - cron: '1,11,51 18,19 * * *'
 
 jobs:
   test-matrix:
@@ -15,7 +13,7 @@ jobs:
           go-version: '1.19'
           cache: true
       - run: go mod download -x
-      - run: go install gotest.tools/gotestsum@d0adc241710a44f874fccf54e821fc6c5c430616
+      - run: go install gotest.tools/gotestsum@v1.9.0
 
       - run: mkdir -p /home/runner/reports
       - uses: actions/cache@v3
